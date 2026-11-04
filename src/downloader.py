@@ -346,6 +346,21 @@ class YouTubeDownloader:
 
         except Exception as e:
             self.logger.error(f"❌ Failed to download: {video_title} - {e}")
+
+            # Remove partial artifacts so a failed download doesn't linger as a
+            # broken episode (stray info.json/webp/jpg/mp4.part files pollute
+            # the feed and occupy cleanup slots).
+            for partial in list(channel_dir.glob(f"{video_id}.*")) + list(
+                thumbnails_dir.glob(f"{video_id}.*")
+            ):
+                try:
+                    partial.unlink()
+                    self.logger.info(f"   🧹 Removed partial file: {partial.name}")
+                except Exception as cleanup_err:
+                    self.logger.warning(
+                        f"   ⚠️ Could not remove {partial.name}: {cleanup_err}"
+                    )
+
             return False
 
     def process_channel(
