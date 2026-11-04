@@ -531,6 +531,30 @@ class DownloadQueue:
                 )
             return len(recovered)
 
+    def requeue_running(self, job_id: str) -> bool:
+        """Return one running job to ``pending`` (its worker is stopping).
+
+        Unlike :meth:`recover_interrupted`, this only touches the job the
+        stopping worker actually claimed, so stopping an idle worker can
+        never requeue a job another process is executing.
+        """
+        with self._locked() as usable:
+            if not usable:
+                return False
+            job_list = self._load_unlocked()
+            job = self._find(job_list, job_id)
+            if job is None or job.get("state") != "running":
+                return False
+            job.update(
+                state="pending",
+                started_at=None,
+                progress=None,
+                next_attempt_at=None,
+            )
+            self._save_unlocked(job_list)
+            self.logger.info(f"♻️  Requeued interrupted job {job_id}")
+            return True
+
     # ---------- internals ----------
 
     @contextmanager
@@ -970,6 +994,9 @@ class QueueWorker:
         self.poll_interval = poll_interval
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # Job id claimed by this worker; used to requeue only our own work
+        # when stopping, instead of every running job in the queue.
+        self._current_job_id: str | None = None
 
     def start(self) -> None:
         """Start the background worker thread."""
@@ -982,12 +1009,19 @@ class QueueWorker:
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Stop without blocking shutdown and requeue interrupted work."""
+        """Stop without blocking shutdown and requeue this worker's own job.
+
+        A job claimed by this worker that is still running after the join
+        timeout is returned to ``pending`` so the next worker resumes it.
+        Jobs claimed by other workers or processes are left untouched.
+        """
         self._stop_event.set()
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout)
-        self.queue.recover_interrupted()
+        job_id = self._current_job_id
+        if job_id is not None:
+            self.queue.requeue_running(job_id)
 
     def run_pending(self) -> int:
         """Drain due jobs synchronously; the caller holds the media lock.
@@ -1027,7 +1061,11 @@ class QueueWorker:
             job = self.queue.claim_next()
             if job is None:
                 return False
-            state = self._execute(job)
+            self._current_job_id = job["id"]
+            try:
+                state = self._execute(job)
+            finally:
+                self._current_job_id = None
         finally:
             if self.media_lock is not None:
                 self.media_lock.release()

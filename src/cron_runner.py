@@ -337,10 +337,12 @@ class AutomationRunner:
             self.logger.error("❌ Another instance is already running, exiting")
             return 1
 
+        notify_config: dict[str, Any] | None = None
         try:
             # Load and validate configuration
             self.logger.info("📄 Loading configuration...")
             channels, global_config = self.load_and_validate_config()
+            notify_config = global_config
             if not channels:
                 self.logger.error("❌ No valid channels to process")
                 return 1
@@ -392,8 +394,6 @@ class AutomationRunner:
                     "⚠️  Some channels had errors - check logs for details"
                 )
 
-            self.notify_health(global_config)
-
             return 0 if error_count == 0 else 1
 
         except Exception as e:
@@ -401,6 +401,10 @@ class AutomationRunner:
             return 1
         finally:
             self.release_lock()
+            # Deliver notifications after releasing the media lock so a
+            # slow webhook never blocks downloads or refreshes.
+            if notify_config is not None:
+                self.notify_health(notify_config)
 
 
 def main():

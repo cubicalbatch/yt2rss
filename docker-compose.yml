@@ -11,6 +11,11 @@ services:
       - ./appdata/:/app/appdata/
     environment:
       - BASE_URL=http://localhost:5000
+      # Optional: protect the UI, feeds and media with a password and
+      # per-channel feed tokens (see README "Authentication").
+      # - YT2RSS_PASSWORD=change-me
+      # - YT2RSS_USERNAME=admin
+      # - YT2RSS_SECRET_KEY=replace-with-a-long-random-value
       # Uncomment and configure to use a SOCKS5 proxy for yt-dlp downloads
       # - YT_DLP_PROXY=socks5://host:port
       # - YT_DLP_PROXY=socks5://user:pass@host:port

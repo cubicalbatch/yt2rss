@@ -7,6 +7,7 @@ HTTP surface through the Flask test client.
 
 import json
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -768,11 +769,37 @@ class TestQueueWorker:
 
     def test_worker_stop_requeues_in_flight_job(self, queue):
         job = enqueue_job(queue)
-        queue.claim_next()  # Simulate a job that was mid-flight.
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_executor(job, cancel_check, progress_callback):
+            started.set()
+            release.wait(5)
+
+        worker = QueueWorker(queue, executor=blocking_executor, poll_interval=0.01)
+        worker.start()
+        try:
+            assert started.wait(5)
+            worker.stop(timeout=0.1)  # Join times out while the executor blocks.
+            state = queue.get(job["id"])
+            assert state["state"] == "pending"
+            assert state["attempts"] == 1
+        finally:
+            release.set()
+            worker.stop()
+
+    def test_stopping_a_worker_leaves_foreign_jobs_alone(self, queue):
+        """Only the claimed job of the stopping worker may be requeued."""
+        job = enqueue_job(queue)
+        other_worker_job = queue.claim_next()  # Another process is running it.
+        assert other_worker_job is not None
+
         worker = QueueWorker(queue, executor=Mock())
         worker.stop()
-        assert queue.get(job["id"])["state"] == "pending"
-        assert queue.get(job["id"])["attempts"] == 1
+
+        state = queue.get(job["id"])
+        assert state["state"] == "running"
+        assert state["attempts"] == 1
 
     def test_deleted_channel_cancels_job(self, test_server, fast_worker):
         job = enqueue_job(test_server.queue, channel="ghost_channel")
