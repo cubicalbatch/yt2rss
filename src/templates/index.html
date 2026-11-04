@@ -46,6 +46,21 @@
                 <!-- Logs will be populated here -->
             </div>
         </div>
+
+        <!-- Download queue panel -->
+        <div id="downloadQueue" class="queue-panel" style="display: none;">
+            <div class="queue-header" onclick="toggleQueuePanel()">
+                <h3>⬇️ Download Queue</h3>
+                <div class="queue-header-right">
+                    <span id="queueSummary" class="queue-summary"></span>
+                    <button class="queue-clear-btn" onclick="clearCompletedJobs(event)">🧹 Clear Completed</button>
+                    <button class="logs-collapse">+</button>
+                </div>
+            </div>
+            <div id="queueContent" class="queue-content" style="display: none;">
+                <!-- Queue jobs will be populated here -->
+            </div>
+        </div>
         
         {% if podcasts %}
         <div class="podcasts-grid">

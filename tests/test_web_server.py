@@ -42,6 +42,7 @@ def app_config():
             },
         ],
         "default_interval_hours": 24,
+        "download_delay_seconds": 0,
     }
 
 

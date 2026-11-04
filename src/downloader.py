@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -12,6 +13,7 @@ from PIL import Image
 
 # Handle both relative and absolute imports
 try:
+    from .download_queue import DownloadCancelled
     from .rss_generator import RSSGenerator
     from .utils import (
         contained_path,
@@ -20,6 +22,7 @@ try:
         validate_channel_settings,
     )
 except ImportError:
+    from download_queue import DownloadCancelled
     from rss_generator import RSSGenerator
     from utils import (
         contained_path,
@@ -223,8 +226,20 @@ class YouTubeDownloader:
         sponsorblock_categories: list[str] | None = None,
         format_type: str = "video",
         quality: str = "max",
+        progress_hook: Callable[[dict[str, Any]], None] | None = None,
     ) -> bool:
-        """Download a single video with SponsorBlock integration."""
+        """Download a single video with SponsorBlock integration.
+
+        Args:
+            video_info: Mapping with at least ``id`` and ``url``.
+            channel_name: Sanitized channel identifier.
+            sponsorblock_categories: SponsorBlock categories to remove.
+            format_type: ``video`` or ``audio``.
+            quality: Quality preset (``max`` or e.g. ``720p``).
+            progress_hook: Optional yt-dlp progress callback. It may raise
+                :class:`DownloadCancelled` to abort cooperatively; partial
+                artifacts are removed and the exception propagates.
+        """
         video_id = video_info["id"]
         if not safe_component(video_id) or not safe_component(channel_name):
             self.logger.error("Invalid channel or video identifier")
@@ -277,6 +292,8 @@ class YouTubeDownloader:
             "merge_output_format": "mp4",
             **self._get_proxy_opts(),
         }
+        if progress_hook is not None:
+            ydl_opts["progress_hooks"] = [progress_hook]
 
         # Add SponsorBlock postprocessor if categories specified
         if sponsorblock_categories:
@@ -410,26 +427,43 @@ class YouTubeDownloader:
             self.logger.info(f"🎉 Successfully downloaded: {video_title}")
             return True
 
+        except DownloadCancelled:
+            self.logger.warning(f"🛑 Download cancelled: {video_title}")
+            self._remove_partial_artifacts(
+                channel_dir, thumbnails_dir, video_id, existing_files
+            )
+            raise
+
         except Exception as e:
             self.logger.error(f"❌ Failed to download: {video_title} - {e}")
-
-            # Remove partial artifacts so a failed download doesn't linger as a
-            # broken episode (stray info.json/webp/jpg/mp4.part files pollute
-            # the feed and occupy cleanup slots).
-            for partial in list(channel_dir.glob(f"{video_id}.*")) + list(
-                thumbnails_dir.glob(f"{video_id}.*")
-            ):
-                if partial in existing_files:
-                    continue
-                try:
-                    partial.unlink()
-                    self.logger.info(f"   🧹 Removed partial file: {partial.name}")
-                except Exception as cleanup_err:
-                    self.logger.warning(
-                        f"   ⚠️ Could not remove {partial.name}: {cleanup_err}"
-                    )
-
+            self._remove_partial_artifacts(
+                channel_dir, thumbnails_dir, video_id, existing_files
+            )
             return False
+
+    def _remove_partial_artifacts(
+        self,
+        channel_dir: Path,
+        thumbnails_dir: Path,
+        video_id: str,
+        existing_files: set[Path],
+    ) -> None:
+        """Remove partial artifacts so a failed download doesn't linger as a
+        broken episode (stray info.json/webp/jpg/mp4.part files pollute
+        the feed and occupy cleanup slots).
+        """
+        for partial in list(channel_dir.glob(f"{video_id}.*")) + list(
+            thumbnails_dir.glob(f"{video_id}.*")
+        ):
+            if partial in existing_files:
+                continue
+            try:
+                partial.unlink()
+                self.logger.info(f"   🧹 Removed partial file: {partial.name}")
+            except Exception as cleanup_err:
+                self.logger.warning(
+                    f"   ⚠️ Could not remove {partial.name}: {cleanup_err}"
+                )
 
     def process_channel(
         self, channel_config: dict[str, Any], global_config: dict[str, Any]

@@ -222,13 +222,14 @@ def test_thread_start_failure_releases_reservation(client, test_server) -> None:
 
 def test_refresh_uses_custom_paths_and_recovers_from_failure(test_server) -> None:
     with patch("src.downloader.YouTubeDownloader") as downloader:
-        downloader.return_value.process_channel.side_effect = RuntimeError("offline")
+        downloader.return_value.get_channel_videos.side_effect = RuntimeError("offline")
         assert test_server._begin_refresh()
         test_server._run_single_channel_refresh("test_channel")
         assert downloader.call_args.kwargs["videos_dir"] == str(test_server.videos_dir)
         assert downloader.call_args.args[0] == str(
             test_server.config_dir / "channels.yaml"
         )
+    assert test_server.queue.jobs() == []
     assert test_server.refresh_status["running"] is False
     assert test_server._begin_refresh()
     test_server._finish_refresh()

@@ -43,6 +43,14 @@ try:
         is_safe_relative_path,
         load_or_create_session_secret,
     )
+    from .download_queue import (
+        ACTIVE_STATES,
+        JOB_STATES,
+        TERMINAL_STATES,
+        DownloadQueue,
+        QueueWorker,
+        execute_queue_job,
+    )
     from .rss_generator import RSSGenerator
     from .utils import (
         MEDIA_EXTENSIONS,
@@ -65,6 +73,14 @@ except ImportError:
         generate_feed_token,
         is_safe_relative_path,
         load_or_create_session_secret,
+    )
+    from download_queue import (
+        ACTIVE_STATES,
+        JOB_STATES,
+        TERMINAL_STATES,
+        DownloadQueue,
+        QueueWorker,
+        execute_queue_job,
     )
     from rss_generator import RSSGenerator
     from utils import (
@@ -163,6 +179,18 @@ class YouTubePodcastServer:
         self.scheduler.start()
         atexit.register(self.close)
 
+        # Durable download queue drained by a single worker thread. Jobs
+        # survive restarts; a shared media lock keeps the worker from
+        # racing refreshes, destructive actions, and the cron runner.
+        self.queue = DownloadQueue(self.config_dir, logger=self.logger)
+        self.queue_worker = QueueWorker(
+            self.queue,
+            executor=self._execute_queue_job,
+            media_lock=self._media_lock,
+            logger=self.logger,
+        )
+        self.queue_worker.start()
+
         # Start automatic refresh schedule
         self._setup_scheduler()
 
@@ -180,6 +208,26 @@ class YouTubePodcastServer:
         """Stop the scheduler once, including during interpreter shutdown."""
         if self.scheduler.running:
             self.scheduler.shutdown()
+        # Non-blocking: an in-flight job is requeued as pending so it
+        # resumes after the next start.
+        self.queue_worker.stop()
+
+    def _execute_queue_job(
+        self,
+        job: dict[str, Any],
+        cancel_check: Callable[[], bool],
+        progress_callback: Callable[[dict[str, Any]], None],
+    ) -> None:
+        """Run one queued download with UI logging wired in."""
+        execute_queue_job(
+            job,
+            videos_dir=self.videos_dir,
+            config_path=self.config_dir / "channels.yaml",
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+            log_handler=UILogHandler(self),
+            logger=self.logger,
+        )
 
     def _setup_auth(self) -> None:
         """Configure optional password authentication from the environment.
@@ -695,6 +743,36 @@ class YouTubePodcastServer:
             """Get current refresh status."""
             return self._handle_refresh_status()
 
+        @self.app.route("/api/queue", methods=["GET"])
+        def get_queue():
+            """List download queue jobs with summary counts."""
+            return self._handle_get_queue()
+
+        @self.app.route("/api/queue/<job_id>", methods=["GET"])
+        def get_queue_job(job_id: str):
+            """Return a single download queue job."""
+            return self._handle_get_queue_job(job_id)
+
+        @self.app.route("/api/queue/<job_id>/cancel", methods=["POST"])
+        def cancel_queue_job(job_id: str):
+            """Cancel a pending job or request cancellation of a running one."""
+            return self._handle_queue_cancel(job_id)
+
+        @self.app.route("/api/queue/<job_id>/retry", methods=["POST"])
+        def retry_queue_job(job_id: str):
+            """Requeue a failed or cancelled download job."""
+            return self._handle_queue_retry(job_id)
+
+        @self.app.route("/api/queue/<job_id>/dismiss", methods=["POST"])
+        def dismiss_queue_job(job_id: str):
+            """Remove a terminal download job from the queue."""
+            return self._handle_queue_dismiss(job_id)
+
+        @self.app.route("/api/queue/clear-completed", methods=["POST"])
+        def clear_completed_queue_jobs():
+            """Remove every completed download job."""
+            return self._handle_queue_clear_completed()
+
         @self.app.route("/api/config/refresh-interval", methods=["GET"])
         def get_refresh_interval():
             """Get current refresh interval."""
@@ -804,7 +882,13 @@ class YouTubePodcastServer:
             self._run_single_channel_refresh(channel_name)
 
     def _run_refresh(self, channel_name: str | None = None) -> None:
-        """Refresh selected channels using the configured storage paths."""
+        """Refresh selected channels by queueing their missing downloads.
+
+        Discovery keeps the existing admission control (it runs while the
+        refresh reservation holds the shared media lock) but enqueues new
+        videos into the durable download queue instead of downloading
+        inline; the queue worker performs the actual downloads afterwards.
+        """
         handler = UILogHandler(self)
         downloader = None
         try:
@@ -827,15 +911,9 @@ class YouTubePodcastServer:
             downloader.logger.addHandler(handler)
             for channel in channels:
                 try:
-                    self._add_log_message(f"Refresh started for {channel['name']}")
-                    downloaded = downloader.process_channel(channel, global_config)
-                    if downloaded >= 0:
-                        self._cleanup_old_episodes(
-                            channel["name"], channel["max_episodes"]
-                        )
-                        self._add_log_message(
-                            f"Refresh completed for {channel['name']}"
-                        )
+                    self._discover_channel_jobs(downloader, channel, global_config)
+                    self._cleanup_old_episodes(channel["name"], channel["max_episodes"])
+                    self._add_log_message(f"Refresh completed for {channel['name']}")
                 except Exception as error:
                     self.logger.error(f"Refresh failed for {channel['name']}: {error}")
                     self._add_log_message(
@@ -848,6 +926,101 @@ class YouTubePodcastServer:
             if downloader is not None:
                 downloader.logger.removeHandler(handler)
             self._finish_refresh()
+
+    def _discover_channel_jobs(
+        self,
+        downloader: Any,
+        channel: dict[str, Any],
+        global_config: dict[str, Any],
+    ) -> int:
+        """Enqueue queue jobs for a channel's new downloadable videos.
+
+        Mirrors the checks ``process_channel`` used to apply inline: skip
+        already downloaded videos, fetch per-video metadata, and respect
+        ``download_delay_hours`` plus ``check_delay_seconds``.
+
+        Args:
+            downloader: Downloader used for discovery only.
+            channel: Channel configuration entry.
+            global_config: Configuration keys outside ``channels``.
+
+        Returns:
+            The number of newly queued jobs.
+        """
+        channel_name = channel["name"]
+        self._add_log_message(f"Refresh started for {channel_name}")
+        max_episodes = channel.get("max_episodes", 10)
+        videos = downloader.get_channel_videos(channel["url"], max_episodes)
+        if not videos:
+            self._add_log_message(f"No videos found for {channel_name}")
+            return 0
+
+        format_type = channel.get("format", "video")
+        download_delay_hours = channel.get("download_delay_hours", 0)
+        check_delay_seconds = channel.get(
+            "check_delay_seconds", global_config.get("check_delay_seconds", 0)
+        )
+        snapshot = {
+            "format": format_type,
+            "quality": channel.get("quality", "max"),
+            "sponsorblock_categories": channel.get("sponsorblock_categories", []),
+            "max_episodes": max_episodes,
+            "download_delay_hours": download_delay_hours,
+            "download_delay_seconds": global_config.get("download_delay_seconds", 60),
+        }
+
+        queued_count = 0
+        for index, video in enumerate(videos, 1):
+            video_id = video["id"]
+            title = video.get("title") or "Unknown Title"
+
+            if downloader.video_exists(channel_name, video_id, format_type):
+                self._add_log_message(f"⏭️  Already downloaded: {title}")
+                self._apply_check_delay(check_delay_seconds, index, len(videos))
+                continue
+
+            detailed_metadata = downloader.get_video_metadata(video["url"])
+            if not detailed_metadata:
+                self._add_log_message(f"❌ Failed to get metadata, skipping: {title}")
+                self._apply_check_delay(check_delay_seconds, index, len(videos))
+                continue
+            video.update(detailed_metadata)
+
+            if downloader.is_video_too_new(video, download_delay_hours):
+                self._add_log_message(
+                    f"⌛ Video too new (< {download_delay_hours}h old): {title}"
+                )
+                self._apply_check_delay(check_delay_seconds, index, len(videos))
+                continue
+
+            job = self.queue.enqueue(
+                channel=channel_name,
+                video_id=video_id,
+                title=title,
+                url=video["url"],
+                snapshot=snapshot,
+            )
+            if job is None:
+                self._add_log_message(f"↩️  Already queued: {title}")
+            else:
+                queued_count += 1
+                self._add_log_message(f"➕ Queued download: {title}")
+            self._apply_check_delay(check_delay_seconds, index, len(videos))
+
+        self._add_log_message(
+            f"📥 Queued {queued_count} new download(s) for {channel_name}"
+        )
+        return queued_count
+
+    def _apply_check_delay(
+        self, check_delay_seconds: float, index: int, total: int
+    ) -> None:
+        """Pause between metadata checks like the inline loop used to."""
+        if check_delay_seconds > 0 and index < total:
+            self._add_log_message(
+                f"   ⏸️  Waiting {check_delay_seconds}s before next video check..."
+            )
+            time.sleep(check_delay_seconds)
 
     def _run_single_channel_refresh(self, channel_name: str):
         """Run a reserved refresh for one channel."""
@@ -901,11 +1074,108 @@ class YouTubePodcastServer:
             # Add recent logs to the status
             status["logs"] = self.recent_logs.copy()
 
+            # Queue counts let the UI distinguish discovery (running)
+            # from the download queue draining in the background.
+            status["queue"] = self.queue.counts()
+
             return jsonify(status), 200
 
         except Exception as e:
             self.logger.error(f"Error getting refresh status: {e}")
             return jsonify({"error": "Failed to get refresh status"}), 500
+
+    def _handle_get_queue(self):
+        """List download queue jobs, optionally filtered by state."""
+        try:
+            state = request.args.get("state")
+            if state is not None and state not in JOB_STATES:
+                return jsonify(
+                    {
+                        "error": "Invalid state; expected one of: "
+                        + ", ".join(JOB_STATES)
+                    }
+                ), 400
+            jobs = self.queue.jobs()
+            if state is not None:
+                jobs = [job for job in jobs if job["state"] == state]
+            jobs.sort(key=lambda job: job.get("created_at") or "")
+            return jsonify({"jobs": jobs, "summary": self.queue.counts()}), 200
+        except Exception as e:
+            self.logger.error(f"Error listing download queue: {e}")
+            return jsonify({"error": "Failed to list download queue"}), 500
+
+    def _handle_get_queue_job(self, job_id: str):
+        """Return a single download queue job."""
+        job = self.queue.get(job_id)
+        if job is None:
+            return jsonify({"error": "Job not found"}), 404
+        return jsonify(job), 200
+
+    def _handle_queue_cancel(self, job_id: str):
+        """Cancel a pending job or request cancellation of a running one."""
+        try:
+            job = self.queue.get(job_id)
+            if job is None:
+                return jsonify({"error": "Job not found"}), 404
+            if job["state"] not in ACTIVE_STATES:
+                return jsonify({"error": f"Cannot cancel a {job['state']} job"}), 409
+            updated = self.queue.request_cancel(job_id)
+            if updated is None:  # Raced with a worker state transition.
+                return jsonify({"error": "Job is no longer active"}), 409
+            message = (
+                "Job cancelled"
+                if updated["state"] == "cancelled"
+                else "Cancellation requested; aborting download"
+            )
+            return jsonify({"message": message, "job": updated}), 200
+        except Exception as e:
+            self.logger.error(f"Error cancelling job {job_id}: {e}")
+            return jsonify({"error": "Failed to cancel job"}), 500
+
+    def _handle_queue_retry(self, job_id: str):
+        """Requeue a failed or cancelled job with a fresh attempt budget."""
+        try:
+            job = self.queue.get(job_id)
+            if job is None:
+                return jsonify({"error": "Job not found"}), 404
+            if job["state"] not in ("failed", "cancelled"):
+                return jsonify({"error": f"Cannot retry a {job['state']} job"}), 409
+            updated = self.queue.retry(job_id)
+            if updated is None:  # Raced with a worker state transition.
+                return jsonify({"error": "Job is no longer retryable"}), 409
+            return jsonify({"message": "Job requeued", "job": updated}), 200
+        except Exception as e:
+            self.logger.error(f"Error retrying job {job_id}: {e}")
+            return jsonify({"error": "Failed to retry job"}), 500
+
+    def _handle_queue_dismiss(self, job_id: str):
+        """Remove a terminal job from the queue."""
+        try:
+            job = self.queue.get(job_id)
+            if job is None:
+                return jsonify({"error": "Job not found"}), 404
+            if job["state"] not in TERMINAL_STATES:
+                return jsonify(
+                    {
+                        "error": "Only completed, failed or cancelled jobs can be dismissed"
+                    }
+                ), 409
+            self.queue.dismiss(job_id)
+            return jsonify({"message": "Job dismissed"}), 200
+        except Exception as e:
+            self.logger.error(f"Error dismissing job {job_id}: {e}")
+            return jsonify({"error": "Failed to dismiss job"}), 500
+
+    def _handle_queue_clear_completed(self):
+        """Remove every completed job from the queue."""
+        try:
+            removed = self.queue.clear_completed()
+            return jsonify(
+                {"message": f"Removed {removed} completed job(s)", "removed": removed}
+            ), 200
+        except Exception as e:
+            self.logger.error(f"Error clearing completed jobs: {e}")
+            return jsonify({"error": "Failed to clear completed jobs"}), 500
 
     def _handle_get_refresh_interval(self):
         """Handle get refresh interval request."""

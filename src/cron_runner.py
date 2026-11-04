@@ -17,9 +17,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Handle both relative and absolute imports
 try:
+    from .download_queue import DownloadQueue, QueueWorker, execute_queue_job
     from .downloader import YouTubeDownloader
     from .utils import cleanup_episodes, safe_component, validate_channel_settings
 except ImportError:
+    from download_queue import DownloadQueue, QueueWorker, execute_queue_job
     from downloader import YouTubeDownloader
     from utils import cleanup_episodes, safe_component, validate_channel_settings
 
@@ -36,6 +38,46 @@ class AutomationRunner:
 
         # Initialize modules
         self.downloader = YouTubeDownloader(str(self.config_path), str(self.base_dir))
+
+        # Drain downloads queued by the web server with the same store and
+        # pipeline. The worker holds no extra lock here: run() already owns
+        # the exclusive flock on media.lock while draining. getattr keeps
+        # construction working when setup_logging is replaced in tests.
+        self.queue = DownloadQueue(
+            self.config_path.parent, logger=getattr(self, "logger", None)
+        )
+        self.queue_worker = QueueWorker(
+            self.queue,
+            executor=self._execute_queue_job,
+            media_lock=None,
+            logger=getattr(self, "logger", None),
+        )
+
+    def _execute_queue_job(
+        self,
+        job: dict[str, Any],
+        cancel_check: Any,
+        progress_callback: Any,
+    ) -> None:
+        """Run one queued download with the runner's paths and logging."""
+        execute_queue_job(
+            job,
+            videos_dir=self.videos_dir,
+            config_path=self.config_path,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+            logger=self.logger,
+        )
+
+    def drain_queue(self) -> int:
+        """Process downloads the web server left queued, then report count."""
+        recovered = self.queue.recover_interrupted()
+        if recovered:
+            self.logger.info(f"♻️  Resumed {recovered} interrupted download job(s)")
+        drained = self.queue_worker.run_pending()
+        if drained:
+            self.logger.info(f"✅ Drained {drained} queued download(s)")
+        return drained
 
     def setup_logging(self):
         """Setup comprehensive logging for the automation runner"""
@@ -215,6 +257,10 @@ class AutomationRunner:
 
             self.logger.info("✅ Configuration loaded successfully")
             self.logger.info(f"📻 Found {len(channels)} channel(s) to process\n")
+
+            # Finish downloads the web server queued before its restart or
+            # between cron runs; we hold the media lock so nothing races.
+            self.drain_queue()
 
             # Process each channel
             processed_count = 0

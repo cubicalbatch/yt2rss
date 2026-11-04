@@ -58,6 +58,7 @@ The web interface provides:
 - **Episode Playback**: Click individual episodes to play them directly in your browser
 - **Per-Channel Refresh**: Individual refresh buttons for each channel with real-time status
 - **Status Monitoring**: View download progress and last refresh times
+- **Download Queue**: Live panel with per-job progress, cancel, retry, and dismiss actions
 - **Configuration**: Adjust refresh intervals and settings per channel
 
 ### Podcast Apps
@@ -98,6 +99,49 @@ Manual and scheduled refreshes share one worker slot. Purge, delete, and
 redownload requests return HTTP 409 while a media operation is running. A failed
 redownload preserves the existing episode. Cleanup counts completed episodes and
 removes all supported media formats belonging to expired episodes.
+
+### Download Queue
+
+Refreshes no longer download videos inline. Discovery enqueues every new
+video into a durable queue (`appdata/config/download_queue.json`), and a
+single worker thread downloads them one at a time:
+
+- Jobs survive restarts: a queue file is written atomically after every
+  change, jobs left `running` by a crash are requeued on startup, and a
+  corrupt queue file is quarantined as `download_queue.json.corrupt` while
+  the app starts with an empty queue.
+- Failed downloads retry automatically up to 5 attempts with a
+  deterministic exponential backoff (60s, 120s, 240s, 480s between
+  attempts); exhausted attempts stay `failed` with the last error until
+  retried or dismissed.
+- Jobs can be cancelled while pending or running (a running download aborts
+  cooperatively and its partial files are removed). Completed history is
+  capped at the newest 200 entries.
+- Duplicate protection: at most one active job per (channel, video).
+- The queue worker shares `media.lock` with refreshes and destructive
+  actions, so downloads never race purge/delete/redownload operations.
+- The channel's *current* format/quality settings apply when a queued job
+  runs; deleting a channel cancels its queued jobs.
+
+The UI shows a collapsible "Download Queue" panel with the active job's
+progress bar, pending count, and failed jobs with Retry/Dismiss actions.
+
+Queue management API (session-authenticated when `YT2RSS_PASSWORD` is set):
+
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/api/queue?state=<state>` | GET | List jobs with summary counts; optional state filter (`pending`, `running`, `completed`, `failed`, `cancelled`) |
+| `/api/queue/<job_id>` | GET | Single job detail (404 if unknown) |
+| `/api/queue/<job_id>/cancel` | POST | Cancel a pending job or request cancellation of a running one (409 for terminal jobs) |
+| `/api/queue/<job_id>/retry` | POST | Requeue a failed/cancelled job with a fresh attempt budget (409 otherwise) |
+| `/api/queue/<job_id>/dismiss` | POST | Remove a terminal job (409 for active jobs) |
+| `/api/queue/clear-completed` | POST | Remove all completed jobs |
+
+`GET /api/refresh/status` additionally reports `queue` counts
+(`pending`/`running`/`failed`/...) so polling clients can tell discovery
+from queue draining. The standalone cron runner drains leftover queue jobs
+with the same store before its normal discovery pass; it never corrupts the
+queue file and holds the same `media.lock` while downloading.
 
 ### SponsorBlock Categories
 

@@ -892,9 +892,209 @@ function startRefreshMonitoring() {
     if (refreshInterval) {
         clearInterval(refreshInterval);
     }
-    
+
     refreshInterval = setInterval(checkRefreshStatus, 1000); // Check every second
     checkRefreshStatus(); // Check immediately
+}
+
+// Download queue panel
+let queuePollTimer = null;
+let queuePanelExpanded = false;
+
+function formatSpeed(bytesPerSecond) {
+    if (typeof bytesPerSecond !== 'number' || bytesPerSecond <= 0) return null;
+    if (bytesPerSecond >= 1024 * 1024) {
+        return (bytesPerSecond / (1024 * 1024)).toFixed(1) + ' MB/s';
+    }
+    return (bytesPerSecond / 1024).toFixed(0) + ' KB/s';
+}
+
+function formatEta(etaSeconds) {
+    if (typeof etaSeconds !== 'number' || etaSeconds < 0) return null;
+    const minutes = Math.floor(etaSeconds / 60);
+    const seconds = Math.floor(etaSeconds % 60);
+    if (minutes >= 60) {
+        const hours = Math.floor(minutes / 60);
+        return `${hours}h ${minutes % 60}m`;
+    }
+    if (minutes > 0) return `${minutes}m ${seconds.toString().padStart(2, '0')}s`;
+    return `${seconds}s`;
+}
+
+async function refreshQueuePanel() {
+    let data;
+    try {
+        const response = await fetch('/api/queue');
+        if (response.status === 401) {
+            // Authentication required; the panel stays hidden until login.
+            renderQueue(null);
+            return;
+        }
+        if (!response.ok) return;
+        data = await response.json();
+    } catch (error) {
+        console.error('Error fetching download queue:', error);
+        return;
+    }
+    renderQueue(data);
+}
+
+function renderQueue(data) {
+    const panel = document.getElementById('downloadQueue');
+    if (!panel) return;
+
+    const jobs = data ? data.jobs || [] : [];
+    const visible = jobs.filter(job =>
+        job.state === 'running' || job.state === 'pending' || job.state === 'failed'
+    );
+    if (visible.length === 0) {
+        panel.style.display = 'none';
+        return;
+    }
+
+    const summary = (data && data.summary) || {};
+    const summaryParts = [];
+    if (summary.running) summaryParts.push(`${summary.running} running`);
+    if (summary.pending) summaryParts.push(`${summary.pending} pending`);
+    if (summary.failed) summaryParts.push(`${summary.failed} failed`);
+    if (summary.completed) summaryParts.push(`${summary.completed} completed`);
+    const summaryElement = document.getElementById('queueSummary');
+    if (summaryElement) summaryElement.textContent = summaryParts.join(' · ');
+
+    panel.style.display = 'block';
+    const content = document.getElementById('queueContent');
+    content.style.display = queuePanelExpanded ? 'block' : 'none';
+    if (!queuePanelExpanded) return;
+
+    const running = visible.filter(job => job.state === 'running');
+    const pending = visible.filter(job => job.state === 'pending');
+    const failed = visible.filter(job => job.state === 'failed');
+    const list = document.createElement('div');
+    list.className = 'queue-list';
+    for (const job of [...running, ...pending, ...failed]) {
+        list.append(buildQueueItem(job));
+    }
+    content.replaceChildren(list);
+}
+
+function buildQueueItem(job) {
+    const item = document.createElement('div');
+    item.className = 'queue-item queue-item-' + job.state;
+
+    const header = document.createElement('div');
+    header.className = 'queue-item-header';
+    const title = document.createElement('span');
+    title.className = 'queue-item-title';
+    title.textContent = job.title || job.video_id;
+    const stateTag = document.createElement('span');
+    stateTag.className = 'queue-item-state';
+    stateTag.textContent = job.state;
+    header.append(title, stateTag);
+    item.append(header);
+
+    const metaParts = [job.channel];
+    if (job.state === 'running' && job.progress) {
+        const speed = formatSpeed(job.progress.speed);
+        if (speed) metaParts.push(speed);
+        const eta = formatEta(job.progress.eta);
+        if (eta) metaParts.push('ETA ' + eta);
+    } else if (job.state === 'pending' && job.attempts > 0) {
+        metaParts.push(`retrying (attempt ${job.attempts}/${job.max_attempts})`);
+    }
+    const meta = document.createElement('div');
+    meta.className = 'queue-item-meta';
+    meta.textContent = metaParts.filter(Boolean).join(' · ');
+    item.append(meta);
+
+    if (job.error && (job.state === 'failed' || job.state === 'pending')) {
+        const error = document.createElement('div');
+        error.className = 'queue-item-error';
+        error.textContent = '❌ ' + job.error;
+        item.append(error);
+    }
+
+    if (job.state === 'running') {
+        const percent = job.progress && typeof job.progress.percent === 'number'
+            ? job.progress.percent
+            : 0;
+        const bar = document.createElement('div');
+        bar.className = 'queue-progress';
+        const fill = document.createElement('div');
+        fill.className = 'queue-progress-fill';
+        fill.style.width = Math.min(100, Math.max(0, percent)) + '%';
+        const label = document.createElement('span');
+        label.className = 'queue-progress-text';
+        label.textContent = Math.round(percent) + '%';
+        bar.append(fill, label);
+        item.append(bar);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'queue-item-actions';
+    if (job.state === 'running' || job.state === 'pending') {
+        actions.append(queueActionButton('✖️ Cancel', () => cancelQueueJob(job.id)));
+    }
+    if (job.state === 'failed') {
+        actions.append(queueActionButton('🔄 Retry', () => retryQueueJob(job.id)));
+        actions.append(queueActionButton('🗑️ Dismiss', () => dismissQueueJob(job.id)));
+    }
+    if (actions.children.length > 0) item.append(actions);
+    return item;
+}
+
+function queueActionButton(label, handler) {
+    const button = document.createElement('button');
+    button.className = 'queue-action-btn';
+    button.textContent = label;
+    button.addEventListener('click', () => handler(button));
+    return button;
+}
+
+async function queueAction(url, successMessage) {
+    try {
+        const response = await fetch(url, { method: 'POST' });
+        if (!response.ok) {
+            const data = await response.json();
+            throw new Error(data.error || 'Queue action failed');
+        }
+        showToast(successMessage);
+        await refreshQueuePanel();
+    } catch (error) {
+        console.error('Queue action failed:', error);
+        showToast('❌ ' + (error.message || 'Queue action failed'));
+    }
+}
+
+function cancelQueueJob(jobId) {
+    return queueAction(`/api/queue/${encodeURIComponent(jobId)}/cancel`, '🛑 Job cancelled');
+}
+
+function retryQueueJob(jobId) {
+    return queueAction(`/api/queue/${encodeURIComponent(jobId)}/retry`, '🔄 Job requeued');
+}
+
+function dismissQueueJob(jobId) {
+    return queueAction(`/api/queue/${encodeURIComponent(jobId)}/dismiss`, '🗑️ Job dismissed');
+}
+
+function clearCompletedJobs(event) {
+    if (event) event.stopPropagation();
+    return queueAction('/api/queue/clear-completed', '🧹 Completed jobs cleared');
+}
+
+function toggleQueuePanel() {
+    queuePanelExpanded = !queuePanelExpanded;
+    const content = document.getElementById('queueContent');
+    const toggleBtn = document.querySelector('#downloadQueue .logs-collapse');
+    if (content) content.style.display = queuePanelExpanded ? 'block' : 'none';
+    if (toggleBtn) toggleBtn.textContent = queuePanelExpanded ? '−' : '+';
+    if (queuePanelExpanded) refreshQueuePanel();
+}
+
+function startQueuePolling() {
+    if (queuePollTimer) return;
+    refreshQueuePanel();
+    queuePollTimer = setInterval(refreshQueuePanel, 2000);
 }
 
 // Relative time formatting
@@ -1057,6 +1257,7 @@ async function refreshSingleChannel(channelName, button) {
 // Check refresh status on page load
 document.addEventListener('DOMContentLoaded', function() {
     checkRefreshStatus();
+    startQueuePolling();
     updateRelativeTimes();
     
     // Update relative times every minute
