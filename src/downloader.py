@@ -20,9 +20,12 @@ try:
         free_disk_bytes,
         load_storage_settings,
         measure_media_usage,
+        tombstoned_ids,
     )
     from .utils import (
         contained_path,
+        filter_skip_reason,
+        load_episode_filters,
         safe_component,
         save_json_file,
         validate_channel_settings,
@@ -35,9 +38,12 @@ except ImportError:
         free_disk_bytes,
         load_storage_settings,
         measure_media_usage,
+        tombstoned_ids,
     )
     from utils import (
         contained_path,
+        filter_skip_reason,
+        load_episode_filters,
         safe_component,
         save_json_file,
         validate_channel_settings,
@@ -148,6 +154,10 @@ class YouTubeDownloader:
                                 "url": f"https://www.youtube.com/watch?v={entry.get('id')}",
                                 "upload_date": entry.get("upload_date"),
                                 "duration": entry.get("duration"),
+                                # Live markers feed the skip_livestreams filter.
+                                "live_status": entry.get("live_status"),
+                                "is_live": entry.get("is_live"),
+                                "was_live": entry.get("was_live"),
                             }
                         )
 
@@ -178,6 +188,11 @@ class YouTubeDownloader:
                         "duration": info.get("duration"),
                         "filesize": info.get("filesize") or info.get("filesize_approx"),
                         "url": video_url,
+                        # Live markers feed the skip_livestreams filter when
+                        # queue execution re-checks filters after enqueue.
+                        "live_status": info.get("live_status"),
+                        "is_live": info.get("is_live"),
+                        "was_live": info.get("was_live"),
                     }
                 else:
                     return {}
@@ -427,6 +442,11 @@ class YouTubeDownloader:
                     "timestamp": metadata.get("timestamp"),
                     "uploader": metadata.get("uploader"),
                     "view_count": metadata.get("view_count", 0),
+                    # Live markers let the feed and episodes API apply
+                    # ``skip_livestreams`` to downloaded episodes too.
+                    "live_status": metadata.get("live_status"),
+                    "is_live": bool(metadata.get("is_live")),
+                    "was_live": bool(metadata.get("was_live")),
                 }
 
                 # Save simplified metadata
@@ -528,6 +548,12 @@ class YouTubeDownloader:
             self.logger.warning(f"⚠️  No videos found for channel: {channel_name}")
             return 0
 
+        # Episode filters and tombstones keep filtered and manually deleted
+        # videos out of the inline download loop, exactly like discovery
+        # keeps them out of the download queue.
+        filters = load_episode_filters(channel_config)
+        deleted = tombstoned_ids(Path(self.config_path).parent, channel_name)
+
         # Download videos
         downloaded_count = 0
         self.logger.info(f"\n🔍 Checking {len(videos)} videos for download...")
@@ -556,6 +582,21 @@ class YouTubeDownloader:
 
             self.logger.info(f"\n[{i}/{len(videos)}] 🔎 Checking: {video_title}")
 
+            if video_id in deleted:
+                self.logger.info(
+                    f"   🪦 Skipping episode deleted by the user: {video_title}"
+                )
+                apply_check_delay()
+                continue
+
+            # Cheap filters (title rules, known durations, live markers)
+            # run before any per-video metadata request.
+            skip_reason = filter_skip_reason(video, filters)
+            if skip_reason is not None:
+                self.logger.info(f"   🚫 Skipped by episode filter: {skip_reason}")
+                apply_check_delay()
+                continue
+
             # Check if already downloaded
             if self.video_exists(channel_name, video_id, format_type):
                 self.logger.info("   ⏭️  Already downloaded, skipping")
@@ -572,6 +613,14 @@ class YouTubeDownloader:
 
             # Update video info with detailed metadata
             video.update(detailed_metadata)
+
+            # Duration bounds and Shorts detection are re-applied now that
+            # the authoritative metadata replaced the flat entry values.
+            skip_reason = filter_skip_reason(video, filters)
+            if skip_reason is not None:
+                self.logger.info(f"   🚫 Skipped by episode filter: {skip_reason}")
+                apply_check_delay()
+                continue
 
             # Check if video is too new
             if self.is_video_too_new(video, download_delay_hours):

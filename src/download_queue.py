@@ -36,8 +36,16 @@ try:
         effective_channel_storage,
         load_storage_settings,
         pinned_ids,
+        tombstoned_ids,
     )
-    from .utils import MediaLock, atomic_write_text, cleanup_episodes, contained_path
+    from .utils import (
+        MediaLock,
+        atomic_write_text,
+        cleanup_episodes,
+        contained_path,
+        filter_skip_reason,
+        load_episode_filters,
+    )
 except ImportError:
     from storage import (
         admission_error,
@@ -45,8 +53,16 @@ except ImportError:
         effective_channel_storage,
         load_storage_settings,
         pinned_ids,
+        tombstoned_ids,
     )
-    from utils import MediaLock, atomic_write_text, cleanup_episodes, contained_path
+    from utils import (
+        MediaLock,
+        atomic_write_text,
+        cleanup_episodes,
+        contained_path,
+        filter_skip_reason,
+        load_episode_filters,
+    )
 
 QUEUE_FILENAME = "download_queue.json"
 COMPLETED_HISTORY_LIMIT = 200
@@ -84,6 +100,16 @@ class DownloadCancelled(Exception):
 
 class ChannelMissingError(Exception):
     """Raised when a queued job's channel is no longer configured."""
+
+
+class EpisodeFilteredError(Exception):
+    """Raised when a queued video may no longer be downloaded.
+
+    Execution re-checks the channel's *current* episode filters and the
+    tombstones of manually deleted episodes, so a job enqueued before a
+    configuration change (or before the user deleted the episode) is
+    retired as ``cancelled`` instead of downloading.
+    """
 
 
 class StorageLimitError(RuntimeError):
@@ -709,6 +735,9 @@ def execute_queue_job(
     Raises:
         DownloadCancelled: When ``cancel_check`` reports a cancellation.
         ChannelMissingError: When the channel is no longer configured.
+        EpisodeFilteredError: When the channel's current filters exclude
+            the video or it was deleted (tombstoned) by the user; the
+            worker retires such jobs as cancelled.
         StorageLimitError: When quota or free-space protection blocks the
             download; the worker retires such jobs as terminal failures.
         RuntimeError: When the download failed.
@@ -741,6 +770,16 @@ def execute_queue_job(
             snapshot.get("sponsorblock_categories", []),
         )
         max_episodes = channel.get("max_episodes", snapshot.get("max_episodes", 10))
+
+        # The channel's current configuration wins over the enqueue
+        # snapshot: a video that is now filtered out or was deleted by the
+        # user must never be downloaded.
+        _check_episode_filters(
+            job,
+            channel=channel,
+            config_dir=config_path.parent,
+            downloader=downloader,
+        )
 
         if downloader.video_exists(channel_name, job["video_id"], format_type):
             queue_logger.info(
@@ -805,6 +844,51 @@ def _job_estimate_bytes(job: dict[str, Any]) -> int | None:
     if isinstance(estimate, int) and not isinstance(estimate, bool) and estimate > 0:
         return estimate
     return None
+
+
+def _check_episode_filters(
+    job: dict[str, Any],
+    *,
+    channel: dict[str, Any],
+    config_dir: Path,
+    downloader: Any,
+) -> None:
+    """Raise :class:`EpisodeFilteredError` when the job may not download.
+
+    Tombstones always apply. Title rules are checked against the job's
+    recorded title; duration bounds, Shorts and livestream filters need
+    video details the job does not carry, so metadata is fetched from the
+    current channel configuration whenever those filters are active. A
+    failed metadata fetch never blocks the download on its own — the
+    download itself reports such failures.
+
+    Args:
+        job: Persisted job record.
+        channel: The channel's *current* configuration entry.
+        config_dir: Directory holding ``tombstones.json``.
+        downloader: Downloader used for on-demand metadata fetches.
+    """
+    video_id = job["video_id"]
+    if video_id in tombstoned_ids(config_dir, job["channel"]):
+        raise EpisodeFilteredError(
+            f"Episode {video_id} was deleted by the user and is remembered as deleted"
+        )
+    filters = load_episode_filters(channel)
+    video: dict[str, Any] = {
+        "id": video_id,
+        "title": job.get("title") or "",
+        "url": job.get("url") or "",
+    }
+    if (
+        filters["min_duration_seconds"] > 0
+        or filters["max_duration_seconds"] > 0
+        or filters["skip_shorts"]
+        or filters["skip_livestreams"]
+    ):
+        video.update(downloader.get_video_metadata(job["url"]))
+    reason = filter_skip_reason(video, filters)
+    if reason is not None:
+        raise EpisodeFilteredError(f"Filtered by current channel config: {reason}")
 
 
 def _check_storage_admission(
@@ -937,17 +1021,21 @@ class QueueWorker:
             return False
         if self.media_lock is not None and not self.media_lock.acquire(blocking=False):
             return False
+        job: dict[str, Any] | None = None
+        state = ""
         try:
             job = self.queue.claim_next()
             if job is None:
                 return False
             state = self._execute(job)
-            if state == "completed":
-                self._wait_inter_job_delay(job)
-            return True
         finally:
             if self.media_lock is not None:
                 self.media_lock.release()
+        # Politeness pauses must not hold the media lock: otherwise a manual
+        # refresh, delete or redownload returns 409 for the whole delay.
+        if job is not None and state == "completed":
+            self._wait_inter_job_delay(job)
+        return True
 
     def _execute(self, job: dict[str, Any]) -> str:
         """Run the executor and translate the outcome into job state."""
@@ -987,6 +1075,9 @@ class QueueWorker:
         except ChannelMissingError as missing:
             self.logger.warning(f"Channel removed; cancelling job: {missing}")
             self.queue.mark_cancelled(job_id, error=str(missing))
+        except EpisodeFilteredError as filtered:
+            self.logger.info(f"Skipping filtered job ({job_id}): {filtered}")
+            self.queue.mark_cancelled(job_id, error=str(filtered))
         except StorageLimitError as limit:
             self.logger.warning(f"Storage limit blocked job ({job_id}): {limit}")
             self.queue.mark_failed_terminal(job_id, error=str(limit))

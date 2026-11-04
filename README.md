@@ -6,6 +6,8 @@ A self-hosted solution that converts YouTube channels into podcast RSS feeds. Su
 
 - **Automatic Downloads**: Monitor YouTube channels for video or M4A audio, with configurable video quality
 - **SponsorBlock Integration**: Automatically remove sponsored segments, self-promotion, and other unwanted content
+- **Episode Filters**: Per-channel title include/exclude rules, duration limits, and skip Shorts/livestreams toggles
+- **Remembered Deletions**: Manually deleted episodes are never re-downloaded by refreshes
 - **Podcast RSS Feeds**: Generate standard RSS feeds compatible with any podcast app
 - **Per-Channel Scheduling**: Individual refresh controls with configurable intervals for each channel
 - **Episode Playback**: Click episodes to play directly in your browser
@@ -90,12 +92,53 @@ channels:
     sponsorblock_categories:
       - sponsor
       - selfpromo
+    # Episode filters (all optional; absent keys disable the filter):
+    title_include:             # when set, a title must contain at least one rule
+      - review
+      - interview
+    title_exclude:             # titles matching any rule are never downloaded
+      - trailer
+    min_duration_seconds: 300  # skip episodes shorter than this (0 = no limit)
+    max_duration_seconds: 7200 # skip episodes longer than this (0 = no limit)
+    skip_shorts: true          # skip YouTube Shorts (60 seconds or less)
+    skip_livestreams: true     # skip live, upcoming and was-live streams
 ```
 
 Refresh intervals can be fractional (for example, `0.5` for 30 minutes), up to
 8760 hours. Episode limits must be positive integers. The API validates settings
 before saving them. Configuration files are replaced atomically; a malformed
 existing file must be repaired before configuration changes can be saved.
+
+### Episode Filters
+
+Every filter is optional; channels without filter keys behave exactly as
+before (backwards compatible). Matching semantics:
+
+- **Title rules** are case-insensitive substrings, compared with Unicode
+  case folding; surrounding whitespace on a rule is ignored. When
+  `title_include` is non-empty, a title must contain at least one rule.
+  **Exclusions win**: a title matching any `title_exclude` rule is skipped
+  even when it matches an include rule.
+- **Duration bounds** apply to `min_duration_seconds`/`max_duration_seconds`
+  (non-negative integers; `0` or absent disables a bound). Videos with an
+  unknown duration are never skipped by duration rules.
+- **Shorts** are videos whose duration is at most 60 seconds — unknown
+  durations are never classified as Shorts.
+- **Livestreams** are detected from yt-dlp's flat entry `live_status`
+  (`is_live`, `is_upcoming`) or the `is_live`/`was_live` flags; past
+  broadcasts flagged `was_live` also count as livestreams.
+
+Filters are enforced in three places: refresh discovery checks cheap fields
+(title, Shorts, livestreams) before each metadata request and re-applies
+duration bounds to the fetched metadata; queue execution re-checks the
+channel's *current* filters (plus tombstones) when a job runs, so editing
+filters also cancels queued jobs — such jobs are retired as `cancelled`
+with the matched rule as the reason; and the RSS feed, the episodes API and
+the episode counts hide episodes on disk that the current filters exclude
+(files are never deleted). Downloaded episode metadata keeps the live
+markers, so `skip_livestreams` also hides stored livestreams; episodes
+downloaded before those markers were recorded stay visible. Every skip is
+logged with the matched rule in the refresh logs.
 
 Manual and scheduled refreshes share one worker slot. Purge, delete, and
 redownload requests return HTTP 409 while a media operation is running. A failed
@@ -194,6 +237,34 @@ Storage API (session-authenticated when `YT2RSS_PASSWORD` is set):
 The web UI adds a storage panel with usage/quota bars and a free-space
 warning, storage fields in the scheduler modal, per-channel quota and
 retention fields in the channel modal, and a pin toggle in the episode list.
+
+### Remembered Deletions (Tombstones)
+
+Deleting an episode from the episode browser records it in
+`appdata/config/tombstones.json` (`{channel: {video_id: {deleted_at,
+title}}}`) so refreshes never download it again:
+
+- Discovery skips tombstoned videos (logged as "deleted by the user"), and
+  queue execution cancels a queued job for a tombstoned video instead of
+  downloading it. The RSS feed and episode counts never include them.
+- A corrupt `tombstones.json` is quarantined as `tombstones.json.corrupt`
+  and the app starts with an empty set — deletions are lost, not crashes.
+- An **explicit redownload** of a remembered-deleted episode is allowed
+  and clears its tombstone on success, making it a normal episode again.
+- **Purge is an explicit reset**: it clears the channel's tombstones, so a
+  later refresh may download previously deleted episodes again. Deleting a
+  channel also removes its tombstones.
+- The channel's danger zone shows "Deleted episodes remembered: N" with a
+  one-click "Forget Remembered Deletions" button.
+
+Tombstone API (session-authenticated when `YT2RSS_PASSWORD` is set; all
+endpoints return 404 for unknown channels):
+
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/api/channels/<channel>/tombstones` | GET | List remembered deletions with `total_count` |
+| `/api/channels/<channel>/tombstones` | DELETE | Forget all remembered deletions for the channel |
+| `/api/channels/<channel>/tombstones/<video_id>` | DELETE | Forget one remembered deletion (404 if not remembered) |
 
 ### SponsorBlock Categories
 

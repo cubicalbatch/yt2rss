@@ -295,25 +295,3 @@ class RSSGenerator:
 
         rss_content = fg.rss_str(pretty=True).decode("utf-8")
         return self._apply_feed_token(rss_content, tokenizable_urls)
-
-    def generate_rss_feed_from_filesystem(
-        self, channel_name: str, videos_dir: Path, display_name: str | None = None
-    ) -> str:
-        """Generate RSS feed content dynamically from filesystem without saving to file"""
-        channel_path = videos_dir / channel_name
-
-        # Scan for videos
-        videos = self.scan_channel_videos(channel_path)
-        if not videos:
-            self.logger.info(
-                f"No videos found for channel: {channel_name}, generating empty RSS feed"
-            )
-
-        # Generate RSS content with display name (works with empty video list)
-        rss_content = self.generate_rss_feed(channel_name, videos, display_name)
-
-        display_title = display_name if display_name else channel_name
-        self.logger.info(
-            f"Generated dynamic RSS feed for {display_title} ({channel_name}) with {len(videos)} episodes"
-        )
-        return rss_content

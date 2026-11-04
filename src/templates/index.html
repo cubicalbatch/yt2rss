@@ -251,6 +251,75 @@
 
                 <div class="form-row">
                     <div class="form-group">
+                        <label class="form-label" for="titleInclude">
+                            Title Include Filters
+                            <span class="tooltip">
+                                <span class="tooltip-trigger">?</span>
+                                <span class="tooltip-content">Comma- or newline-separated substrings. When set, only episodes whose title contains at least one of them (case-insensitive) are downloaded. Leave empty to allow all titles.</span>
+                            </span>
+                        </label>
+                        <textarea id="titleInclude" class="form-input" rows="2" placeholder="e.g., review, interview"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="titleExclude">
+                            Title Exclude Filters
+                            <span class="tooltip">
+                                <span class="tooltip-trigger">?</span>
+                                <span class="tooltip-content">Comma- or newline-separated substrings. Episodes whose title contains any of them (case-insensitive) are never downloaded. Exclusions win over include filters.</span>
+                            </span>
+                        </label>
+                        <textarea id="titleExclude" class="form-input" rows="2" placeholder="e.g., trailer, announcement"></textarea>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label" for="minDurationMinutes">
+                            Minimum Duration (minutes)
+                            <span class="tooltip">
+                                <span class="tooltip-trigger">?</span>
+                                <span class="tooltip-content">Skip episodes shorter than this many minutes. Videos with unknown duration are never skipped. 0 disables the limit.</span>
+                            </span>
+                        </label>
+                        <input type="number" id="minDurationMinutes" class="form-input"
+                               placeholder="0 = no limit" min="0" step="any">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="maxDurationMinutes">
+                            Maximum Duration (minutes)
+                            <span class="tooltip">
+                                <span class="tooltip-trigger">?</span>
+                                <span class="tooltip-content">Skip episodes longer than this many minutes. Videos with unknown duration are never skipped. 0 disables the limit.</span>
+                            </span>
+                        </label>
+                        <input type="number" id="maxDurationMinutes" class="form-input"
+                               placeholder="0 = no limit" min="0" step="any">
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">
+                        Content Filters
+                        <span class="tooltip">
+                            <span class="tooltip-trigger">?</span>
+                            <span class="tooltip-content">Automatically skip certain kinds of content during refreshes. Shorts are videos of up to 60 seconds; livestream filters cover currently live and scheduled streams.</span>
+                        </span>
+                    </label>
+                    <div class="checkbox-group filter-checks">
+                        <div class="checkbox-item">
+                            <input type="checkbox" id="skipShorts">
+                            <label for="skipShorts">Skip YouTube Shorts (≤ 60s)</label>
+                        </div>
+                        <div class="checkbox-item">
+                            <input type="checkbox" id="skipLivestreams">
+                            <label for="skipLivestreams">Skip livestreams</label>
+                        </div>
+                    </div>
+                    <div class="form-help">Applies during refreshes, to queued downloads, and to the feed. Title/duration filters also hide matching downloaded episodes; livestream hiding needs live markers recorded at download time.</div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
                         <label class="form-label" for="channelQuota">
                             Quota (GB)
                             <span class="tooltip">
@@ -282,7 +351,7 @@
                             <span class="tooltip-content">Select which types of content segments to automatically skip or remove using community-contributed SponsorBlock data. This helps create cleaner podcast episodes.</span>
                         </span>
                     </label>
-                    <div class="checkbox-group">
+                    <div class="checkbox-group" id="sponsorblockGroup">
                         <div class="checkbox-item">
                             <input type="checkbox" id="sponsor" value="sponsor">
                             <label for="sponsor">Sponsor</label>
@@ -334,6 +403,17 @@
                     <p class="danger-zone-description">
                         Destructive actions that cannot be undone. Use with caution.
                     </p>
+                    <div id="tombstoneRow" class="tombstone-row" style="display: none;">
+                        <span class="tombstone-count">
+                            🪦 Deleted episodes remembered: <strong id="tombstoneCount">0</strong>
+                        </span>
+                        <button type="button" class="btn-danger-zone" onclick="clearTombstones()">
+                            🧹 Forget Remembered Deletions
+                        </button>
+                        <div class="danger-zone-help">
+                            Manually deleted episodes are remembered so refreshes never re-download them. Forgetting them lets the next refresh download those episodes again.
+                        </div>
+                    </div>
                     <button type="button" class="btn-danger-zone" onclick="purgeEpisodes()">
                         🗑️ Purge All Downloaded Episodes
                     </button>

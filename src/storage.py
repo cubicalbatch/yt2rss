@@ -9,6 +9,12 @@ traversed.
 Pins live in ``config_dir/pins.json`` as ``{"<channel>": ["<video_id>", ...]}``
 so they survive episode metadata rewrites and redownloads; they are removed
 only when the episode or its channel is deleted.
+
+Tombstones live in ``config_dir/tombstones.json`` as
+``{"<channel>": {"<video_id>": {"deleted_at": ..., "title": ...}}}`` and
+remember manually deleted episodes so discovery, queue execution, the RSS
+feed and the episodes API never bring them back. An explicit channel purge
+(forget via the API) or channel deletion clears them.
 """
 
 import json
@@ -19,7 +25,7 @@ import stat
 import threading
 import time
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -431,6 +437,145 @@ def remove_channel_pins(config_dir: str | Path, channel_name: str) -> None:
         if channel_name in pins:
             del pins[channel_name]
             save_pins(config_dir, pins)
+
+
+# ---------- tombstones ----------
+
+
+TOMBSTONES_FILENAME = "tombstones.json"
+_tombstones_lock = threading.Lock()
+
+
+def tombstones_path(config_dir: str | Path) -> Path:
+    """Return the tombstones file location inside ``config_dir``."""
+    return Path(config_dir) / TOMBSTONES_FILENAME
+
+
+def load_tombstones(config_dir: str | Path) -> dict[str, dict[str, dict[str, str]]]:
+    """Load remembered deletions per channel; corrupt data reads as empty.
+
+    A corrupt file is backed up as ``tombstones.json.corrupt`` so the
+    original bytes are never lost; loading must never crash the server.
+
+    Returns:
+        ``{channel: {video_id: {"deleted_at": iso, "title": str}}}`` with
+        invalid entries dropped.
+    """
+    path = tombstones_path(config_dir)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("tombstones file must be an object")
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        logging.error(f"Tombstones file is corrupt ({error}); starting empty")
+        backup = Path(f"{path}.corrupt")
+        try:
+            path.replace(backup)
+            logging.info(f"Kept corrupt tombstones file as {backup.name}")
+        except OSError as backup_error:
+            logging.error(f"Could not back up corrupt tombstones file: {backup_error}")
+        return {}
+    tombstones: dict[str, dict[str, dict[str, str]]] = {}
+    for channel, entries in data.items():
+        if not isinstance(entries, dict):
+            continue
+        cleaned: dict[str, dict[str, str]] = {}
+        for video_id, record in entries.items():
+            if isinstance(video_id, str) and isinstance(record, dict):
+                cleaned[video_id] = {
+                    "deleted_at": str(record.get("deleted_at") or ""),
+                    "title": str(record.get("title") or ""),
+                }
+        if cleaned:
+            tombstones[str(channel)] = cleaned
+    return tombstones
+
+
+def save_tombstones(
+    config_dir: str | Path, tombstones: dict[str, dict[str, dict[str, str]]]
+) -> bool:
+    """Persist tombstones atomically; return False when the write failed."""
+    try:
+        atomic_write_text(
+            tombstones_path(config_dir),
+            json.dumps(tombstones, indent=2, sort_keys=True),
+        )
+        return True
+    except OSError as error:
+        logging.error(f"Failed to save tombstones: {error}")
+        return False
+
+
+def tombstoned_ids(config_dir: str | Path, channel_name: str) -> set[str]:
+    """Return the set of remembered-deleted video ids for one channel."""
+    return set(load_tombstones(config_dir).get(channel_name, ()))
+
+
+def record_tombstone(
+    config_dir: str | Path,
+    channel_name: str,
+    video_id: str,
+    title: str,
+    deleted_at: str | None = None,
+) -> bool:
+    """Remember a manually deleted episode so refreshes skip it forever.
+
+    Args:
+        config_dir: Directory holding ``tombstones.json``.
+        channel_name: Sanitized channel identifier.
+        video_id: YouTube video identifier.
+        title: Episode title kept for identification in the UI.
+        deleted_at: ISO-8601 deletion time; defaults to now (UTC).
+
+    Returns:
+        False only when persistence failed.
+    """
+    with _tombstones_lock:
+        tombstones = load_tombstones(config_dir)
+        tombstones.setdefault(channel_name, {})[video_id] = {
+            "deleted_at": deleted_at or datetime.now(UTC).isoformat(),
+            "title": str(title or video_id),
+        }
+        return save_tombstones(config_dir, tombstones)
+
+
+def remove_episode_tombstone(
+    config_dir: str | Path, channel_name: str, video_id: str
+) -> bool:
+    """Forget one deletion, e.g. after an explicit redownload succeeded.
+
+    Returns:
+        True when a tombstone record was removed.
+    """
+    with _tombstones_lock:
+        tombstones = load_tombstones(config_dir)
+        channel = tombstones.get(channel_name)
+        if not channel or video_id not in channel:
+            return False
+        del channel[video_id]
+        if not channel:
+            tombstones.pop(channel_name, None)
+        save_tombstones(config_dir, tombstones)
+        return True
+
+
+def remove_channel_tombstones(config_dir: str | Path, channel_name: str) -> int:
+    """Drop every tombstone for a channel; return how many were removed.
+
+    Used by an explicit purge (a reset: deleted episodes may be downloaded
+    again) and by channel deletion.
+    """
+    with _tombstones_lock:
+        tombstones = load_tombstones(config_dir)
+        channel = tombstones.get(channel_name)
+        if not channel:
+            return 0
+        removed = len(channel)
+        del tombstones[channel_name]
+        save_tombstones(config_dir, tombstones)
+        return removed
 
 
 # ---------- retention ----------

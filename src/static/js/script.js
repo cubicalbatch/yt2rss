@@ -106,13 +106,14 @@ function openAddChannelModal() {
     document.getElementById('modalTitle').textContent = 'Add New Channel';
     document.getElementById('submitBtn').textContent = 'Add Channel';
     document.getElementById('dangerZone').style.display = 'none';
+    document.getElementById('tombstoneRow').style.display = 'none';
     clearForm();
-    
+
     // Pre-check sponsor-related categories
     document.getElementById('sponsor').checked = true;
     document.getElementById('selfpromo').checked = true;
     document.getElementById('interaction').checked = true;
-    
+
     document.getElementById('channelModal').style.display = 'block';
     setTimeout(adjustTooltipPositions, 100);
 }
@@ -123,19 +124,20 @@ async function openEditChannelModal(channelName) {
     document.getElementById('modalTitle').textContent = 'Edit Channel';
     document.getElementById('submitBtn').textContent = 'Update Channel';
     document.getElementById('dangerZone').style.display = 'block';
-    
+
     // Reset danger zone to collapsed state
     document.getElementById('dangerZoneContent').classList.remove('expanded');
     document.getElementById('dangerZoneToggle').classList.remove('rotated');
-    
+
     // Load channel data
     try {
         const response = await fetch('/api/channels');
         const data = await response.json();
         const channel = data.channels.find(ch => ch.name === channelName);
-        
+
         if (channel) {
             populateForm(channel);
+            refreshTombstoneRow();
             document.getElementById('channelModal').style.display = 'block';
             setTimeout(adjustTooltipPositions, 100);
         } else {
@@ -205,9 +207,26 @@ function closeScheduleModal() {
 // Form management
 function clearForm() {
     document.getElementById('channelForm').reset();
-    // Clear all checkboxes
-    const checkboxes = document.querySelectorAll('#channelForm input[type="checkbox"]');
+    // Clear only the SponsorBlock checkboxes; the filter checkboxes
+    // (skipShorts/skipLivestreams) default to false via form.reset().
+    const checkboxes = document.querySelectorAll('#sponsorblockGroup input[type="checkbox"]');
     checkboxes.forEach(cb => cb.checked = false);
+}
+
+// Parse comma- or newline-separated title filter rules.
+function parseFilterRules(text) {
+    return text.split(/[\n,]+/).map(rule => rule.trim()).filter(Boolean);
+}
+
+// Convert a minutes input to whole seconds; 0/empty means "no limit".
+function minutesToSeconds(text) {
+    const minutes = parseFloat(text);
+    return Number.isFinite(minutes) && minutes > 0 ? Math.round(minutes * 60) : 0;
+}
+
+// Convert stored seconds to a minutes input value; empty when disabled.
+function secondsToMinutes(seconds) {
+    return seconds > 0 ? seconds / 60 : '';
 }
 
 function populateForm(channel) {
@@ -220,9 +239,17 @@ function populateForm(channel) {
     document.getElementById('channelQuota').value = channel.quota_gb > 0 ? channel.quota_gb : '';
     document.getElementById('channelRetention').value = channel.retention_days > 0 ? channel.retention_days : '';
 
+    // Episode filters
+    document.getElementById('titleInclude').value = (channel.title_include || []).join(', ');
+    document.getElementById('titleExclude').value = (channel.title_exclude || []).join(', ');
+    document.getElementById('minDurationMinutes').value = secondsToMinutes(channel.min_duration_seconds || 0);
+    document.getElementById('maxDurationMinutes').value = secondsToMinutes(channel.max_duration_seconds || 0);
+    document.getElementById('skipShorts').checked = channel.skip_shorts === true;
+    document.getElementById('skipLivestreams').checked = channel.skip_livestreams === true;
+
     // Set SponsorBlock categories
     const categories = channel.sponsorblock_categories || [];
-    const checkboxes = document.querySelectorAll('#channelForm input[type="checkbox"]');
+    const checkboxes = document.querySelectorAll('#sponsorblockGroup input[type="checkbox"]');
     checkboxes.forEach(cb => {
         cb.checked = categories.includes(cb.value);
     });
@@ -238,13 +265,19 @@ function getFormData() {
         quality: document.getElementById('quality').value || 'max',
         quota_gb: parseFloat(document.getElementById('channelQuota').value) || 0,
         retention_days: parseInt(document.getElementById('channelRetention').value) || 0,
+        title_include: parseFilterRules(document.getElementById('titleInclude').value),
+        title_exclude: parseFilterRules(document.getElementById('titleExclude').value),
+        min_duration_seconds: minutesToSeconds(document.getElementById('minDurationMinutes').value),
+        max_duration_seconds: minutesToSeconds(document.getElementById('maxDurationMinutes').value),
+        skip_shorts: document.getElementById('skipShorts').checked,
+        skip_livestreams: document.getElementById('skipLivestreams').checked,
         sponsorblock_categories: []
     };
-    
+
     // Get selected SponsorBlock categories
-    const checkboxes = document.querySelectorAll('#channelForm input[type="checkbox"]:checked');
+    const checkboxes = document.querySelectorAll('#sponsorblockGroup input[type="checkbox"]:checked');
     formData.sponsorblock_categories = Array.from(checkboxes).map(cb => cb.value);
-    
+
     return formData;
 }
 
@@ -360,8 +393,54 @@ async function deleteChannelFromDangerZone() {
         showToast('❌ No channel selected');
         return;
     }
-    
+
     await deleteChannel(currentChannelName);
+}
+
+// Tombstones: manually deleted episodes remembered so refreshes skip them.
+async function refreshTombstoneRow() {
+    const row = document.getElementById('tombstoneRow');
+    if (!row || !currentChannelName) return;
+    try {
+        const response = await fetch(`/api/channels/${encodeURIComponent(currentChannelName)}/tombstones`);
+        if (!response.ok) {
+            row.style.display = 'none';
+            return;
+        }
+        const data = await response.json();
+        const count = data.total_count || 0;
+        document.getElementById('tombstoneCount').textContent = count;
+        row.style.display = count > 0 ? 'block' : 'none';
+    } catch (error) {
+        console.error('Error loading remembered deletions:', error);
+        row.style.display = 'none';
+    }
+}
+
+async function clearTombstones() {
+    if (!currentChannelName) {
+        showToast('❌ No channel selected');
+        return;
+    }
+
+    if (!confirm('Forget all remembered deletions for this channel?\n\nThe next refresh may download episodes you deleted manually again.')) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`/api/channels/${encodeURIComponent(currentChannelName)}/tombstones`, {
+            method: 'DELETE'
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to forget remembered deletions');
+        }
+        showToast('🧹 Remembered deletions forgotten');
+        refreshTombstoneRow();
+    } catch (error) {
+        console.error('Error forgetting remembered deletions:', error);
+        showToast('❌ ' + (error.message || 'Failed to forget remembered deletions'));
+    }
 }
 
 // Scheduler form submission

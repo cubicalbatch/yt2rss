@@ -389,33 +389,34 @@ class TestRSSGenerator:
         assert 'type="audio/mp4"' in rss_content
         assert 'type="video/webm"' in rss_content
 
-    @patch.object(RSSGenerator, "scan_channel_videos")
-    def test_generate_rss_feed_from_filesystem_success(
-        self, mock_scan, rss_generator, temp_dir, sample_episodes
+    def test_scan_and_generate_compose_into_feed(
+        self, rss_generator, temp_dir, sample_episodes
     ):
-        """Test RSS feed generation from filesystem."""
-        mock_scan.return_value = sample_episodes
+        """Scan + generate compose into a feed (the web server's composition)."""
+        channel_dir = Path(temp_dir) / "test-channel"
+        channel_dir.mkdir()
+        for episode in sample_episodes:
+            (channel_dir / f"{episode['id']}.json").write_text(
+                json.dumps(episode), encoding="utf-8"
+            )
+            (channel_dir / f"{episode['id']}.mp4").write_bytes(b"media")
 
-        videos_dir = Path(temp_dir)
-        rss_content = rss_generator.generate_rss_feed_from_filesystem(
-            "test-channel", videos_dir, "My Channel"
+        videos = rss_generator.scan_channel_videos(channel_dir)
+        rss_content = rss_generator.generate_rss_feed(
+            "test-channel", videos, "My Channel"
         )
 
         assert "<title>My Channel</title>" in rss_content
         assert "Test Episode 1" in rss_content
-        mock_scan.assert_called_once()
+        assert "Test Episode 2 &amp; Special Characters" in rss_content
 
-    @patch.object(RSSGenerator, "scan_channel_videos")
-    def test_generate_rss_feed_from_filesystem_no_videos(
-        self, mock_scan, rss_generator, temp_dir
-    ):
-        """Test RSS feed generation from filesystem with no videos."""
-        mock_scan.return_value = []
+    def test_scan_and_generate_empty_channel(self, rss_generator, temp_dir):
+        """An empty channel directory yields a feed without items."""
+        channel_dir = Path(temp_dir) / "test-channel"
+        channel_dir.mkdir()
 
-        videos_dir = Path(temp_dir)
-        rss_content = rss_generator.generate_rss_feed_from_filesystem(
-            "test-channel", videos_dir
-        )
+        videos = rss_generator.scan_channel_videos(channel_dir)
+        rss_content = rss_generator.generate_rss_feed("test-channel", videos)
 
         assert "<title>Test-Channel</title>" in rss_content
         assert "<item>" not in rss_content

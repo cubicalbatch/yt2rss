@@ -554,6 +554,8 @@ class TestQueueWorker:
                 "description": "d",
                 "upload_date": "20240101",
                 "duration": 5,
+                "live_status": "was_live",
+                "was_live": True,
             }
             (channel_dir / f"{video_id}.info.json").write_text(json.dumps(metadata))
             # The fixture channel is configured for audio extraction.
@@ -573,6 +575,9 @@ class TestQueueWorker:
         simplified = json.loads((channel_dir / "video1.json").read_text())
         assert simplified["id"] == "video1"
         assert simplified["thumbnail"] == "thumbnails/video1.jpg"
+        assert simplified["live_status"] == "was_live"
+        assert simplified["was_live"] is True
+        assert simplified["is_live"] is False
         assert (channel_dir / "thumbnails" / "video1.jpg").exists()
         assert not (channel_dir / "video1.info.json").exists()
         timestamps = json.loads(
@@ -698,6 +703,23 @@ class TestQueueWorker:
             )
         stub = StubDownloader.instances[-1]
         assert len(stub.download_calls) == 1
+
+    def test_inter_job_delay_releases_media_lock(self, test_server, fast_worker):
+        """A politeness pause must not block manual refreshes or deletes."""
+        snapshot = {
+            "format": "video",
+            "quality": "max",
+            "max_episodes": 5,
+            "download_delay_seconds": 30,
+        }
+        with patch("src.downloader.YouTubeDownloader", StubDownloader):
+            job = enqueue_job(test_server.queue, snapshot=snapshot)
+            assert wait_until(
+                lambda: test_server.queue.get(job["id"])["state"] == "completed"
+            )
+            lock = test_server._media_lock
+            assert wait_until(lambda: lock.acquire(blocking=False))
+            lock.release()
 
     def test_two_workers_never_double_process(self, test_server):
         test_server.queue_worker.stop()

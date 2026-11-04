@@ -17,6 +17,14 @@ MEDIA_EXTENSIONS = (".mp4", ".m4a", ".mp3", ".webm", ".mkv", ".avi")
 MAX_QUOTA_GB = 16384
 MAX_MIN_FREE_GB = 1024
 MAX_RETENTION_DAYS = 36500
+# Episode filters: YouTube defines Shorts as videos of up to 60 seconds;
+# unknown durations are never classified as Shorts.
+SHORTS_MAX_DURATION_SECONDS = 60
+# yt-dlp ``live_status`` values that mark a currently live or scheduled stream.
+LIVE_ACTIVE_STATUSES = ("is_live", "is_upcoming")
+# Sane bounds for title filter rule lists (rules, characters per rule).
+MAX_TITLE_FILTER_RULES = 100
+MAX_TITLE_FILTER_LENGTH = 500
 SPONSORBLOCK_CATEGORIES = {
     "sponsor",
     "selfpromo",
@@ -176,6 +184,157 @@ def validate_channel_settings(data: dict[str, Any]) -> None:
             raise ValueError(
                 "sponsorblock_categories must be a list of supported categories"
             )
+    for field in ("title_include", "title_exclude"):
+        if field not in data:
+            continue
+        rules = data[field]
+        if not isinstance(rules, list) or len(rules) > MAX_TITLE_FILTER_RULES:
+            raise ValueError(
+                f"{field} must be a list of at most {MAX_TITLE_FILTER_RULES} strings"
+            )
+        for rule in rules:
+            if not isinstance(rule, str) or not rule.strip():
+                raise ValueError(f"{field} entries must be non-empty strings")
+            if len(rule) > MAX_TITLE_FILTER_LENGTH:
+                raise ValueError(
+                    f"{field} entries must be at most "
+                    f"{MAX_TITLE_FILTER_LENGTH} characters"
+                )
+    for field in ("min_duration_seconds", "max_duration_seconds"):
+        if field in data and (type(data[field]) is not int or data[field] < 0):
+            raise ValueError(
+                f"{field} must be a non-negative integer (0 disables the limit)"
+            )
+    if (
+        type(data.get("min_duration_seconds")) is int
+        and type(data.get("max_duration_seconds")) is int
+        and data["min_duration_seconds"] > data["max_duration_seconds"]
+    ):
+        raise ValueError("min_duration_seconds must not exceed max_duration_seconds")
+    for field in ("skip_shorts", "skip_livestreams"):
+        if field in data and type(data[field]) is not bool:
+            raise ValueError(f"{field} must be true or false")
+
+
+def load_episode_filters(channel: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a channel's episode filters, defaulting invalid values.
+
+    Mirrors :func:`storage.load_storage_settings`: values written through
+    the API are already validated, but a hand-edited ``channels.yaml`` can
+    carry anything, so wrong types fall back to "no filter" instead of
+    crashing discovery or downloads.
+
+    Args:
+        channel: Channel configuration entry.
+
+    Returns:
+        A new dict with ``title_include``/``title_exclude`` rule lists,
+        ``min_duration_seconds``/``max_duration_seconds`` (``0`` = no
+        bound) and the ``skip_shorts``/``skip_livestreams`` flags.
+    """
+
+    def rules(field: str) -> list[str]:
+        value = channel.get(field)
+        if not isinstance(value, list):
+            return []
+        return [rule for rule in value if isinstance(rule, str) and rule.strip()]
+
+    def seconds(field: str) -> int:
+        value = channel.get(field)
+        return value if type(value) is int and value > 0 else 0
+
+    return {
+        "title_include": rules("title_include"),
+        "title_exclude": rules("title_exclude"),
+        "min_duration_seconds": seconds("min_duration_seconds"),
+        "max_duration_seconds": seconds("max_duration_seconds"),
+        "skip_shorts": channel.get("skip_shorts") is True,
+        "skip_livestreams": channel.get("skip_livestreams") is True,
+    }
+
+
+def is_livestream_entry(entry: dict[str, Any]) -> bool:
+    """Detect livestreams in yt-dlp entries and episode metadata.
+
+    Flat channel entries carry ``live_status`` (``is_live``, ``is_upcoming``,
+    ...); older extractions expose the ``is_live``/``was_live`` booleans
+    instead. Past broadcasts flagged ``was_live`` also count as livestreams.
+
+    Args:
+        entry: Flat yt-dlp entry or episode metadata mapping.
+
+    Returns:
+        True when the entry represents a livestream.
+    """
+    if not isinstance(entry, dict):
+        return False
+    status = entry.get("live_status")
+    if isinstance(status, str) and status in LIVE_ACTIVE_STATUSES:
+        return True
+    return bool(entry.get("is_live")) or bool(entry.get("was_live"))
+
+
+def _matched_title_rule(title: str, rules: list[str]) -> str | None:
+    """Return the first rule contained in the title, or None.
+
+    Matching is case-insensitive (``casefold`` for unicode stability) and
+    ignores surrounding whitespace on the configured rules.
+    """
+    folded = title.casefold()
+    for rule in rules:
+        if rule.strip().casefold() in folded:
+            return rule
+    return None
+
+
+def filter_skip_reason(video: dict[str, Any], filters: dict[str, Any]) -> str | None:
+    """Explain why a video is excluded by a channel's episode filters.
+
+    Exclusion wins over inclusion. Durations and live status that a source
+    does not provide are never used against the video: unknown durations
+    cannot be classified as Shorts and cannot violate duration bounds, and
+    entries without live markers are not livestreams.
+
+    Args:
+        video: Flat yt-dlp entry or on-disk episode metadata.
+        filters: Resolved filters from :func:`load_episode_filters`.
+
+    Returns:
+        A human-readable reason mentioning the matched rule, or None when
+        the video passes every configured filter.
+    """
+    title = str(video.get("title") or "")
+    excluded = _matched_title_rule(title, filters.get("title_exclude") or [])
+    if excluded is not None:
+        return f"title matches exclude rule '{excluded}'"
+    include = filters.get("title_include") or []
+    if include:
+        included = _matched_title_rule(title, include)
+        if included is None:
+            return f"title matches no include rule ({', '.join(include)})"
+    if filters.get("skip_livestreams") and is_livestream_entry(video):
+        status = video.get("live_status")
+        detail = f"live_status={status}" if status else "live flags set"
+        return f"livestream ({detail})"
+    duration = video.get("duration")
+    # Unknown durations never violate bounds and are never Shorts.
+    if (
+        not isinstance(duration, (int, float))
+        or isinstance(duration, bool)
+        or duration < 0
+    ):
+        return None
+    minimum = filters.get("min_duration_seconds") or 0
+    maximum = filters.get("max_duration_seconds") or 0
+    if minimum > 0 and duration < minimum:
+        return f"duration {duration}s is below min_duration_seconds ({minimum}s)"
+    if maximum > 0 and duration > maximum:
+        return f"duration {duration}s exceeds max_duration_seconds ({maximum}s)"
+    if filters.get("skip_shorts") and duration <= SHORTS_MAX_DURATION_SECONDS:
+        return (
+            f"YouTube Short (duration {duration:g}s <= {SHORTS_MAX_DURATION_SECONDS}s)"
+        )
+    return None
 
 
 def cleanup_episodes(

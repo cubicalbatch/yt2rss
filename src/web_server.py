@@ -62,11 +62,16 @@ try:
         is_positive_number,
         load_pins,
         load_storage_settings,
+        load_tombstones,
         measure_media_usage,
         pinned_ids,
+        record_tombstone,
         remove_channel_pins,
+        remove_channel_tombstones,
         remove_episode_pin,
+        remove_episode_tombstone,
         set_episode_pinned,
+        tombstoned_ids,
         validate_storage_settings,
     )
     from .utils import (
@@ -76,7 +81,8 @@ try:
         cleanup_episodes,
         contained_path,
         ensure_directory,
-        get_video_files,
+        filter_skip_reason,
+        load_episode_filters,
         safe_component,
         sanitize_channel_name,
         setup_logging,
@@ -110,11 +116,16 @@ except ImportError:
         is_positive_number,
         load_pins,
         load_storage_settings,
+        load_tombstones,
         measure_media_usage,
         pinned_ids,
+        record_tombstone,
         remove_channel_pins,
+        remove_channel_tombstones,
         remove_episode_pin,
+        remove_episode_tombstone,
         set_episode_pinned,
+        tombstoned_ids,
         validate_storage_settings,
     )
     from utils import (
@@ -124,7 +135,8 @@ except ImportError:
         cleanup_episodes,
         contained_path,
         ensure_directory,
-        get_video_files,
+        filter_skip_reason,
+        load_episode_filters,
         safe_component,
         sanitize_channel_name,
         setup_logging,
@@ -482,6 +494,42 @@ class YouTubePodcastServer:
             return iso_timestamp
         except (ValueError, AttributeError):
             return ""
+
+    def _channel_exists(self, channel_name: str) -> bool:
+        """Check the configured channels contain ``channel_name``."""
+        config = self._load_channel_config()
+        return any(ch["name"] == channel_name for ch in config.get("channels", []))
+
+    def _visible_episodes(
+        self, channel_name: str, channel_config: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Episodes shown to users for a channel (feed, API and counts).
+
+        Applies the channel's episode filters and its tombstones to the
+        episodes stored on disk; files are never deleted here. Downloaded
+        metadata keeps yt-dlp's live markers, so ``skip_livestreams`` also
+        applies to stored episodes; episodes downloaded before those
+        markers were recorded stay visible.
+
+        Args:
+            channel_name: Sanitized channel identifier.
+            channel_config: The channel's configuration entry.
+
+        Returns:
+            The episode metadata dicts that pass every filter.
+        """
+        generator = RSSGenerator()
+        episodes = generator.scan_channel_videos(self.videos_dir / channel_name)
+        filters = load_episode_filters(channel_config)
+        deleted = tombstoned_ids(self.config_dir, channel_name)
+        visible = []
+        for episode in episodes:
+            if str(episode.get("id") or "") in deleted:
+                continue
+            if filter_skip_reason(episode, filters) is not None:
+                continue
+            visible.append(episode)
+        return visible
 
     def _load_channel_config(self):
         """Load channel configuration from YAML file."""
@@ -852,6 +900,23 @@ class YouTubePodcastServer:
             """Purge downloaded episodes for a channel and regenerate RSS."""
             return self._handle_purge_episodes(channel_name)
 
+        @self.app.route("/api/channels/<channel_name>/tombstones", methods=["GET"])
+        def get_channel_tombstones(channel_name: str):
+            """List the episodes remembered as deleted for a channel."""
+            return self._handle_get_tombstones(channel_name)
+
+        @self.app.route("/api/channels/<channel_name>/tombstones", methods=["DELETE"])
+        def clear_channel_tombstones(channel_name: str):
+            """Forget every remembered deletion for a channel."""
+            return self._handle_clear_tombstones(channel_name)
+
+        @self.app.route(
+            "/api/channels/<channel_name>/tombstones/<episode_id>", methods=["DELETE"]
+        )
+        def forget_channel_tombstone(channel_name: str, episode_id: str):
+            """Forget one remembered deletion."""
+            return self._handle_forget_tombstone(channel_name, episode_id)
+
         @self.app.route("/api/channels/<channel_name>/episodes", methods=["GET"])
         def get_channel_episodes(channel_name: str):
             """Get list of downloaded episodes for a channel."""
@@ -1020,7 +1085,10 @@ class YouTubePodcastServer:
         already downloaded videos, fetch per-video metadata, and respect
         ``download_delay_hours`` plus ``check_delay_seconds``. Videos that
         would exceed the storage quota or the free-space minimum are not
-        queued; the block is logged as a warning instead.
+        queued; the block is logged as a warning instead. Videos excluded
+        by the channel's episode filters (title rules, duration bounds,
+        Shorts, livestreams) or remembered as deleted (tombstones) are
+        never queued; each skip is logged with the matched rule.
 
         Args:
             downloader: Downloader used for discovery only.
@@ -1061,10 +1129,29 @@ class YouTubePodcastServer:
             free_error = str(error)
         channel_dir = contained_path(self.videos_dir, channel_name)
 
+        # Filtered and manually deleted videos never reach the queue; the
+        # queue re-checks both again at execution time.
+        filters = load_episode_filters(channel)
+        deleted = tombstoned_ids(self.config_dir, channel_name)
+
         queued_count = 0
         for index, video in enumerate(videos, 1):
             video_id = video["id"]
             title = video.get("title") or "Unknown Title"
+
+            if video_id in deleted:
+                message = f"🪦 Skipping episode deleted by the user: {title}"
+                self.logger.info(message)
+                self._add_log_message(message)
+                self._apply_check_delay(check_delay_seconds, index, len(videos))
+                continue
+
+            # Cheap filters (title rules, known durations, live markers)
+            # run before the per-video metadata request.
+            skip_reason = filter_skip_reason(video, filters)
+            if skip_reason is not None:
+                self._log_filter_skip(title, skip_reason)
+                continue
 
             if downloader.video_exists(channel_name, video_id, format_type):
                 self._add_log_message(f"⏭️  Already downloaded: {title}")
@@ -1077,6 +1164,14 @@ class YouTubePodcastServer:
                 self._apply_check_delay(check_delay_seconds, index, len(videos))
                 continue
             video.update(detailed_metadata)
+
+            # Duration bounds and Shorts detection are re-applied now that
+            # the authoritative metadata replaced the flat entry values.
+            skip_reason = filter_skip_reason(video, filters)
+            if skip_reason is not None:
+                self._log_filter_skip(title, skip_reason)
+                self._apply_check_delay(check_delay_seconds, index, len(videos))
+                continue
 
             if downloader.is_video_too_new(video, download_delay_hours):
                 self._add_log_message(
@@ -1138,6 +1233,12 @@ class YouTubePodcastServer:
                 f"   ⏸️  Waiting {check_delay_seconds}s before next video check..."
             )
             time.sleep(check_delay_seconds)
+
+    def _log_filter_skip(self, title: str, reason: str) -> None:
+        """Record that a video was excluded, naming the matched rule."""
+        message = f"🚫 Skipped ({reason}): {title}"
+        self.logger.info(message)
+        self._add_log_message(message)
 
     def _run_single_channel_refresh(self, channel_name: str):
         """Run a reserved refresh for one channel."""
@@ -1746,6 +1847,20 @@ class YouTubePodcastServer:
                     if "retention_days" in data
                     else {}
                 ),
+                # Episode filters; all optional and validated by
+                # ``validate_channel_settings`` before this handler runs.
+                **{
+                    key: data[key]
+                    for key in (
+                        "title_include",
+                        "title_exclude",
+                        "min_duration_seconds",
+                        "max_duration_seconds",
+                        "skip_shorts",
+                        "skip_livestreams",
+                    )
+                    if key in data
+                },
                 "sponsorblock_categories": data.get("sponsorblock_categories", []),
                 "feed_token": generate_feed_token(),
             }
@@ -1844,6 +1959,16 @@ class YouTubePodcastServer:
                 channel["quota_gb"] = data["quota_gb"]
             if "retention_days" in data:
                 channel["retention_days"] = data["retention_days"]
+            for field in (
+                "title_include",
+                "title_exclude",
+                "min_duration_seconds",
+                "max_duration_seconds",
+                "skip_shorts",
+                "skip_livestreams",
+            ):
+                if field in data:
+                    channel[field] = data[field]
 
             # Save config
             if self._save_channel_config(config):
@@ -1883,8 +2008,10 @@ class YouTubePodcastServer:
             if self._save_channel_config(config):
                 # Restart scheduler to remove deleted channel's job
                 self._setup_scheduler()
-                # Pins have no meaning once the channel is gone.
+                # Pins and tombstones have no meaning once the channel is
+                # gone.
                 remove_channel_pins(self.config_dir, channel_name)
+                remove_channel_tombstones(self.config_dir, channel_name)
 
                 return jsonify({"message": "Channel deleted successfully"}), 200
             else:
@@ -1912,7 +2039,12 @@ class YouTubePodcastServer:
 
     @exclusive_media_operation
     def _handle_purge_episodes(self, channel_name: str):
-        """Handle purging episodes for a channel."""
+        """Handle purging episodes for a channel.
+
+        Purge is an explicit reset: the channel's tombstones (remembered
+        deletions) are cleared as well, so a later refresh may download
+        previously deleted episodes again.
+        """
         try:
             import shutil
 
@@ -1928,12 +2060,26 @@ class YouTubePodcastServer:
             channel_video_dir = self.videos_dir / channel_name
 
             if not channel_video_dir.exists():
+                # Purge is an explicit reset: remembered deletions are
+                # forgotten so a later refresh may download everything.
+                removed = remove_channel_tombstones(self.config_dir, channel_name)
+                if removed:
+                    self.logger.info(
+                        f"Forgot {removed} tombstone(s) for channel: {channel_name}"
+                    )
                 return jsonify({"message": "No episodes found to purge"}), 200
 
             # Remove all video files and directories for this channel
             try:
                 shutil.rmtree(str(channel_video_dir))
                 remove_channel_pins(self.config_dir, channel_name)
+                # Purge is an explicit reset: remembered deletions are
+                # forgotten so deleted episodes may be downloaded again.
+                forgotten = remove_channel_tombstones(self.config_dir, channel_name)
+                if forgotten:
+                    self.logger.info(
+                        f"Forgot {forgotten} tombstone(s) for channel: {channel_name}"
+                    )
                 self.logger.info(f"Purged all episodes for channel: {channel_name}")
             except FileNotFoundError:
                 pass  # Directory already doesn't exist
@@ -1974,8 +2120,68 @@ class YouTubePodcastServer:
             self.logger.error(f"Error purging episodes for channel {channel_name}: {e}")
             return jsonify({"error": "Internal server error"}), 500
 
+    def _handle_get_tombstones(self, channel_name: str):
+        """List the episodes remembered as deleted for a channel."""
+        try:
+            if not self._channel_exists(channel_name):
+                return jsonify({"error": "Channel not found"}), 404
+            tombstones = load_tombstones(self.config_dir).get(channel_name, {})
+            return jsonify(
+                {
+                    "channel": channel_name,
+                    "tombstones": tombstones,
+                    "total_count": len(tombstones),
+                }
+            ), 200
+        except Exception as e:
+            self.logger.error(f"Error loading tombstones for {channel_name}: {e}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    @config_transaction
+    def _handle_clear_tombstones(self, channel_name: str):
+        """Forget every remembered deletion for a channel."""
+        try:
+            if not self._channel_exists(channel_name):
+                return jsonify({"error": "Channel not found"}), 404
+            removed = remove_channel_tombstones(self.config_dir, channel_name)
+            self.logger.info(
+                f"Forgot {removed} tombstone(s) for channel: {channel_name}"
+            )
+            return jsonify(
+                {
+                    "message": f"Forgot {removed} remembered deletion(s)",
+                    "removed": removed,
+                }
+            ), 200
+        except Exception as e:
+            self.logger.error(f"Error clearing tombstones for {channel_name}: {e}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    @config_transaction
+    def _handle_forget_tombstone(self, channel_name: str, episode_id: str):
+        """Forget one remembered deletion."""
+        try:
+            if not self._channel_exists(channel_name):
+                return jsonify({"error": "Channel not found"}), 404
+            if not remove_episode_tombstone(self.config_dir, channel_name, episode_id):
+                return jsonify({"error": "Tombstone not found"}), 404
+            self.logger.info(f"Forgot tombstone for {channel_name}/{episode_id}")
+            return jsonify(
+                {"message": "Tombstone removed", "episode_id": episode_id}
+            ), 200
+        except Exception as e:
+            self.logger.error(
+                f"Error forgetting tombstone {channel_name}/{episode_id}: {e}"
+            )
+            return jsonify({"error": "Internal server error"}), 500
+
     def _handle_get_episodes(self, channel_name: str):
-        """Handle getting episodes for a channel."""
+        """Handle getting episodes for a channel.
+
+        Episodes excluded by the channel's current filters or remembered
+        as deleted (tombstones) stay hidden, consistently with the RSS
+        feed and the episode counts; ``total_count`` reflects that view.
+        """
         try:
             # Validate channel exists in config
             config = self._load_channel_config()
@@ -1989,17 +2195,9 @@ class YouTubePodcastServer:
             if not channel_config:
                 return jsonify({"error": "Channel not found"}), 404
 
-            # Load episode data using RSS generator's method
-            try:
-                from .rss_generator import RSSGenerator
-            except ImportError:
-                from rss_generator import RSSGenerator
-
-            base_url = os.getenv("BASE_URL", request.host_url.rstrip("/"))
-            rss_generator = RSSGenerator(base_url)
-
-            channel_path = self.videos_dir / channel_name
-            episodes_data = rss_generator.scan_channel_videos(channel_path)
+            # Filtered and tombstoned episodes stay hidden, consistent
+            # with the RSS feed and the episode counts.
+            episodes_data = self._visible_episodes(channel_name, channel_config)
             pinned = pinned_ids(self.config_dir, channel_name)
 
             # Format episodes for the frontend
@@ -2372,7 +2570,12 @@ class YouTubePodcastServer:
 
     @exclusive_media_operation
     def _handle_delete_episode(self, channel_name: str, episode_id: str):
-        """Handle deletion of a single episode."""
+        """Handle deletion of a single episode.
+
+        The deletion is recorded as a tombstone so discovery and queue
+        execution never re-download this episode; an explicit redownload
+        clears the tombstone again.
+        """
         try:
             # Validate channel exists
             channel_dir = self.videos_dir / channel_name
@@ -2383,6 +2586,17 @@ class YouTubePodcastServer:
             json_file = channel_dir / f"{episode_id}.json"
             if not json_file.exists():
                 return jsonify({"error": "Episode not found"}), 404
+
+            # Remember the title for the tombstone record before the
+            # metadata file disappears.
+            episode_title = episode_id
+            try:
+                with open(json_file, "r", encoding="utf-8") as handle:
+                    metadata = json.load(handle)
+                if isinstance(metadata, dict) and metadata.get("title"):
+                    episode_title = str(metadata["title"])
+            except (OSError, ValueError):
+                pass
 
             # Remove video files
             removed_files = []
@@ -2413,6 +2627,17 @@ class YouTubePodcastServer:
             # The pin dies with the episode it protected.
             remove_episode_pin(self.config_dir, channel_name, episode_id)
 
+            # Remember the deletion so refreshes never re-download this
+            # episode (until it is forgotten explicitly or redownloaded).
+            if record_tombstone(
+                self.config_dir, channel_name, episode_id, episode_title
+            ):
+                self.logger.info(f"Recorded tombstone for deleted episode {episode_id}")
+            else:
+                self.logger.warning(
+                    f"Could not record tombstone for deleted episode {episode_id}"
+                )
+
             # RSS feed will automatically reflect changes on next request (dynamic generation)
             self.logger.info(
                 f"Successfully deleted episode {episode_id}: {', '.join(removed_files)}"
@@ -2433,7 +2658,11 @@ class YouTubePodcastServer:
 
     @exclusive_media_operation
     def _handle_redownload_episode(self, channel_name: str, episode_id: str):
-        """Handle redownloading a single episode."""
+        """Handle redownloading a single episode.
+
+        Explicit redownloads are allowed even for remembered-deleted
+        (tombstoned) episodes; success clears the tombstone.
+        """
         try:
             # Validate channel exists in config
             config = self._load_channel_config()
@@ -2447,20 +2676,29 @@ class YouTubePodcastServer:
             if not channel_config:
                 return jsonify({"error": "Channel not found"}), 404
 
-            # First, delete the existing episode
+            # Redownload replaces the stored episode; for a remembered-
+            # deleted (tombstoned) episode there are no files left, but an
+            # explicit redownload is allowed and clears its tombstone once
+            # it succeeds.
             channel_dir = self.videos_dir / channel_name
             json_file = channel_dir / f"{episode_id}.json"
 
+            tombstone = (
+                load_tombstones(self.config_dir).get(channel_name, {}).get(episode_id)
+            )
+            metadata: dict[str, Any]
             if not json_file.exists():
-                return jsonify({"error": "Episode not found"}), 404
-
-            # Load episode metadata to get video URL
-            try:
-                with open(json_file, "r") as f:
-                    metadata = json.load(f)
-            except Exception as e:
-                self.logger.error(f"Error reading episode metadata: {e}")
-                return jsonify({"error": "Failed to read episode metadata"}), 500
+                if tombstone is None:
+                    return jsonify({"error": "Episode not found"}), 404
+                metadata = {"title": tombstone.get("title") or episode_id}
+            else:
+                # Load episode metadata to get video URL
+                try:
+                    with open(json_file, "r") as f:
+                        metadata = json.load(f)
+                except Exception as e:
+                    self.logger.error(f"Error reading episode metadata: {e}")
+                    return jsonify({"error": "Failed to read episode metadata"}), 500
 
             video_url = f"https://www.youtube.com/watch?v={episode_id}"
             video_title = metadata.get("title", "Unknown")
@@ -2508,6 +2746,7 @@ class YouTubePodcastServer:
                     return jsonify(
                         {"error": "Failed to redownload episode; original preserved"}
                     ), 500
+                channel_dir.mkdir(parents=True, exist_ok=True)
                 thumbnails = channel_dir / "thumbnails"
                 thumbnails.mkdir(exist_ok=True)
                 for thumbnail in (staged_channel / "thumbnails").glob(
@@ -2522,6 +2761,11 @@ class YouTubePodcastServer:
                     old_media = channel_dir / f"{episode_id}{ext}"
                     if old_media.name not in new_names:
                         old_media.unlink(missing_ok=True)
+
+            # A successful explicit redownload lifts the tombstone so the
+            # episode is a normal, downloadable episode again.
+            if remove_episode_tombstone(self.config_dir, channel_name, episode_id):
+                self.logger.info(f"Cleared tombstone for redownloaded {episode_id}")
 
             # RSS feed will automatically reflect changes on next request (dynamic generation)
             self.logger.info(f"Successfully redownloaded episode {episode_id}")
@@ -2560,11 +2804,9 @@ class YouTubePodcastServer:
                 if feed_token:
                     feed_url = f"{feed_url}?token={quote(feed_token, safe='')}"
 
-            # Get episode count for this channel (both video and audio files)
-            channel_dir = self.videos_dir / channel_id
-            episode_count = (
-                len(get_video_files(str(channel_dir))) if channel_dir.exists() else 0
-            )
+            # Episode count matches the feed and episodes API: filtered
+            # and tombstoned episodes are not counted.
+            episode_count = len(self._visible_episodes(channel_id, channel))
 
             # Get last refresh time
             last_refresh_raw = refresh_timestamps.get(channel_id)
@@ -2624,8 +2866,13 @@ class YouTubePodcastServer:
         # Generate RSS feed dynamically from filesystem
         try:
             display_name = channel_config.get("display_name")
-            rss_content = rss_generator.generate_rss_feed_from_filesystem(
-                channel_name, self.videos_dir, display_name
+            episodes = self._visible_episodes(channel_name, channel_config)
+            rss_content = rss_generator.generate_rss_feed(
+                channel_name, episodes, display_name
+            )
+            self.logger.info(
+                f"Generated dynamic RSS feed for {display_name or channel_name} "
+                f"({channel_name}) with {len(episodes)} visible episode(s)"
             )
 
             # Return RSS content directly (works even with empty feeds)

@@ -506,6 +506,11 @@ select.form-input option {
     box-shadow: 0 0 0 3px var(--accent-soft), 0 0 12px var(--glow);
 }
 
+textarea.form-input {
+    resize: vertical;
+    min-height: 56px;
+}
+
 .form-row {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -796,6 +801,22 @@ select.form-input option {
     color: var(--faint);
     line-height: 1.4;
     margin-top: 8px;
+}
+
+/* ---------- Remembered deletions (tombstones) ---------- */
+.tombstone-row {
+    border: 1px solid rgba(239, 68, 68, 0.25);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 16px;
+    background: rgba(239, 68, 68, 0.05);
+}
+
+.tombstone-count {
+    display: block;
+    font-size: 0.85rem;
+    color: var(--text);
+    margin-bottom: 10px;
 }
 
 /* ---------- Tooltips ---------- */
