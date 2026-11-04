@@ -8,6 +8,7 @@ A self-hosted solution that converts YouTube channels into podcast RSS feeds. Su
 - **SponsorBlock Integration**: Automatically remove sponsored segments, self-promotion, and other unwanted content
 - **Episode Filters**: Per-channel title include/exclude rules, duration limits, and skip Shorts/livestreams toggles
 - **Remembered Deletions**: Manually deleted episodes are never re-downloaded by refreshes
+- **Health Monitoring**: Refresh history, repeated-failure and unavailable-channel detection, low-space alerts, and webhook notifications
 - **Podcast RSS Feeds**: Generate standard RSS feeds compatible with any podcast app
 - **Per-Channel Scheduling**: Individual refresh controls with configurable intervals for each channel
 - **Episode Playback**: Click episodes to play directly in your browser
@@ -265,6 +266,59 @@ endpoints return 404 for unknown channels):
 | `/api/channels/<channel>/tombstones` | GET | List remembered deletions with `total_count` |
 | `/api/channels/<channel>/tombstones` | DELETE | Forget all remembered deletions for the channel |
 | `/api/channels/<channel>/tombstones/<video_id>` | DELETE | Forget one remembered deletion (404 if not remembered) |
+
+### Health Monitoring and Notifications
+
+Every channel refresh is recorded in `appdata/config/health.json`:
+consecutive failures, last success/failure, the last error, an
+"unavailable" flag, and a bounded history (last 50 outcomes). The web UI
+shows a collapsible "System Health" panel with per-channel status, free
+disk space, pending alerts, and "Run Check Now".
+
+Notifications are opt-in. Configure them under the `notifications:` key in
+`channels.yaml` (or in the scheduler modal):
+
+```yaml
+notifications:
+  webhook_url: https://example.com/hooks/yt2rss  # empty disables delivery
+  failure_threshold: 3      # consecutive failed refreshes before alerting
+  cooldown_minutes: 360     # minimum time between repeats of the same alert
+  notify_low_space: true    # alert when free space < storage.min_free_space_gb
+```
+
+Alerts are generic JSON `POST`s (works with ntfy, Gotify, Home Assistant,
+Discord relays, custom endpoints):
+
+```json
+{
+  "source": "yt2rss",
+  "event": "channel_failure",
+  "channel": "example_channel",
+  "message": "Channel 'example_channel' failed 3 consecutive refresh(es): ...",
+  "occurred_at": "2026-01-01T00:00:00+00:00",
+  "consecutive_failures": 3,
+  "last_error": "..."
+}
+```
+
+Events: `channel_failure` (threshold reached), `channel_unavailable` (the
+channel URL cannot be fetched — removed, private, blocked), and
+`low_disk_space`. Delivery failures never break a refresh; they are
+recorded in `health.json` (visible in the UI) and retried on the next
+evaluation. The cooldown only advances after a successful delivery. An
+hourly scheduled check evaluates health; refreshes evaluate it as well.
+
+Health API (session-authenticated when `YT2RSS_PASSWORD` is set):
+
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/api/health` | GET | Per-channel state, notification bookkeeping, disk state, pending events |
+| `/api/health/check` | POST | Evaluate now and deliver due notifications synchronously |
+| `/api/config/notifications` | GET/PUT | Read or validate and save notification settings |
+| `/api/notifications/test` | POST | Deliver a test event to the configured webhook |
+
+A corrupt `health.json` is quarantined as `health.json.corrupt` and the app
+starts with empty history. Deleting a channel removes its health state.
 
 ### SponsorBlock Categories
 

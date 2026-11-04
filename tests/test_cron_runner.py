@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 from src.cron_runner import AutomationRunner
+from src.health import load_health, record_refresh
 
 
 @pytest.fixture
@@ -198,3 +199,81 @@ class TestErrorHandling:
         with patch("pathlib.Path.unlink", side_effect=PermissionError("Access denied")):
             # Should not raise exception
             automation_runner.cleanup_old_videos("test_channel", 1)
+
+
+class TestCronHealth:
+    """Cron deployments record health and dispatch notifications."""
+
+    def test_process_channel_records_success(self, automation_runner, test_config):
+        channel = test_config["channels"][0]
+        automation_runner.downloader.process_channel = Mock(return_value=2)
+        automation_runner.cleanup_old_videos = Mock()
+
+        assert automation_runner.process_channel(channel, {}) is True
+
+        state = load_health(automation_runner.config_path.parent)["channels"][
+            "test_channel_1"
+        ]
+        assert state["consecutive_failures"] == 0
+        assert state["last_success_at"]
+        assert state["history"][-1]["queued"] == 2
+
+    def test_process_channel_records_unavailable(self, automation_runner, test_config):
+        channel = test_config["channels"][0]
+        automation_runner.downloader.process_channel = Mock(return_value=0)
+        automation_runner.downloader.last_channel_error = "channel not found"
+        automation_runner.cleanup_old_videos = Mock()
+
+        assert automation_runner.process_channel(channel, {}) is False
+
+        state = load_health(automation_runner.config_path.parent)["channels"][
+            "test_channel_1"
+        ]
+        assert state["unavailable"] is True
+        assert "channel not found" in state["last_error"]
+
+    def test_process_channel_records_failure(self, automation_runner, test_config):
+        channel = test_config["channels"][0]
+        automation_runner.downloader.process_channel = Mock(
+            side_effect=RuntimeError("boom")
+        )
+        automation_runner.cleanup_old_videos = Mock()
+
+        assert automation_runner.process_channel(channel, {}) is False
+
+        state = load_health(automation_runner.config_path.parent)["channels"][
+            "test_channel_1"
+        ]
+        assert state["consecutive_failures"] == 1
+        assert state["unavailable"] is False
+        assert "boom" in state["last_error"]
+
+    def test_notify_health_dispatches_due_events(self, automation_runner):
+        config_dir = automation_runner.config_path.parent
+        for _ in range(3):
+            record_refresh(config_dir, "test_channel_1", success=False, error="boom")
+        global_config = {
+            "notifications": {
+                "webhook_url": "https://example.test/hook",
+                "failure_threshold": 3,
+                "cooldown_minutes": 0,
+            },
+            "storage": {"min_free_space_gb": 0},
+        }
+        with (
+            patch("src.cron_runner.dispatch_events") as dispatch,
+            patch("src.cron_runner.free_disk_bytes", return_value=10**12),
+        ):
+            automation_runner.notify_health(global_config)
+
+        dispatch.assert_called_once()
+        events = dispatch.call_args.args[1]
+        assert [event["event"] for event in events] == ["channel_failure"]
+
+    def test_notify_health_without_webhook_does_not_dispatch(self, automation_runner):
+        config_dir = automation_runner.config_path.parent
+        for _ in range(3):
+            record_refresh(config_dir, "test_channel_1", success=False, error="boom")
+        with patch("src.cron_runner.dispatch_events") as dispatch:
+            automation_runner.notify_health({})
+        dispatch.assert_not_called()

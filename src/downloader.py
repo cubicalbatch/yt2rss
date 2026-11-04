@@ -75,6 +75,9 @@ class YouTubeDownloader:
             handlers=[logging.StreamHandler()],
         )
         self.logger = logging.getLogger(__name__)
+        # Set by ``get_channel_videos`` so discovery can distinguish a
+        # genuinely empty channel from a fetch failure (health tracking).
+        self.last_channel_error: str | None = None
 
         # Initialize RSS generator for timestamp updates
         self.rss_generator = RSSGenerator()
@@ -118,6 +121,7 @@ class YouTubeDownloader:
         self, channel_url: str, max_episodes: int = 10
     ) -> list[dict[str, Any]]:
         """Get video information from a YouTube channel."""
+        self.last_channel_error = None
         self.logger.info(
             f"📡 Fetching video list from channel (max {max_episodes} episodes)..."
         )
@@ -135,6 +139,7 @@ class YouTubeDownloader:
                 info = ydl.extract_info(channel_url, download=False)
 
                 if not info or "entries" not in info:
+                    self.last_channel_error = "No channel data returned"
                     self.logger.warning(
                         f"❌ No videos found for channel: {channel_url}"
                     )
@@ -165,6 +170,7 @@ class YouTubeDownloader:
                 return videos
 
         except Exception as e:
+            self.last_channel_error = str(e)
             self.logger.error(f"Failed to get channel videos: {e}")
             return []
 

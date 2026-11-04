@@ -10,9 +10,15 @@ class Element {
         this.children = [];
         this.style = {};
         this.listeners = {};
-        this.textContent = '';
+        this._textContent = '';
     }
+    set textContent(value) {
+        this._textContent = value;
+        if (value === '') this.children = [];
+    }
+    get textContent() { return this._textContent; }
     append(...children) { this.children.push(...children); }
+    appendChild(child) { this.children.push(child); }
     replaceChildren(...children) { this.children = children; }
     addEventListener(event, listener) { this.listeners[event] = listener; }
     set innerHTML(html) {
@@ -101,4 +107,39 @@ test('pinned episodes show a badge and offer unpinning', async () => {
     assert.equal(buttons[5].textContent, '📍 Unpin');
     buttons[5].listeners.click();
     assert.deepEqual(toggles, [true]);
+});
+
+test('health panel renders channel state, disk and pending alerts', async () => {
+    const { context, elements } = setup();
+    context.fetch = async () => ({
+        ok: true,
+        json: async () => ({
+            channels: {
+                example: {
+                    consecutive_failures: 3,
+                    unavailable: false,
+                    last_success_at: null,
+                    last_failure_at: '2026-01-01T00:00:00Z',
+                    last_error: 'boom',
+                    history: [],
+                },
+            },
+            notifications: { settings: { webhook_url: '' }, last_error: null },
+            disk: { free_bytes: 1024 ** 3, min_free_space_gb: 2 },
+            pending_events: [
+                { event: 'channel_failure', message: 'Channel failed three times' },
+            ],
+        }),
+    });
+    await context.refreshHealthPanel();
+    const row = elements.get('healthChannels').children[0];
+    assert.equal(row.children[0].textContent, 'example');
+    assert.match(row.children[1].textContent, /3 consecutive failure/);
+    assert.equal(row.className, 'health-row degraded');
+    assert.match(elements.get('healthDisk').textContent, /1\.00 GB/);
+    assert.equal(elements.get('healthDisk').className, 'health-disk low');
+    assert.match(elements.get('healthSummary').textContent, /1 issue/);
+    assert.ok(elements.get('healthNotifications').children.some(
+        child => (child.textContent || '').includes('Channel failed three times')
+    ));
 });

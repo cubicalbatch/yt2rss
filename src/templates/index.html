@@ -47,6 +47,23 @@
             </div>
         </div>
 
+        <!-- Health panel -->
+        <div id="healthPanel" class="health-panel">
+            <div class="health-header" onclick="toggleHealthPanel()">
+                <h3>🩺 System Health <span id="healthSummary" class="health-summary"></span></h3>
+                <button class="logs-collapse" id="healthToggle">+</button>
+            </div>
+            <div id="healthContent" class="health-content" style="display: none;">
+                <div id="healthDisk" class="health-disk"></div>
+                <div id="healthChannels" class="health-grid"></div>
+                <div id="healthNotifications" class="health-notifications"></div>
+                <div class="health-actions">
+                    <button type="button" class="btn btn-secondary" onclick="runHealthCheck()">🔍 Run Check Now</button>
+                    <button type="button" class="btn btn-secondary" onclick="openScheduleModal()">⚙️ Notification Settings</button>
+                </div>
+            </div>
+        </div>
+
         <!-- Download queue panel -->
         <div id="downloadQueue" class="queue-panel" style="display: none;">
             <div class="queue-header" onclick="toggleQueuePanel()">
@@ -484,6 +501,44 @@
                     <input type="number" id="retentionDays" class="form-input"
                            placeholder="0 = disabled" min="0" max="36500" step="1">
                     <div class="form-help">Runs at startup, once per day, and after every refresh. Pinned episodes are never deleted.</div>
+                </div>
+
+                <h3 class="section-title">Notifications</h3>
+                <div class="form-group">
+                    <label class="form-label" for="webhookUrl">
+                        Webhook URL
+                        <span class="tooltip">
+                            <span class="tooltip-trigger">?</span>
+                            <span class="tooltip-content">Receives JSON POST requests for repeated refresh failures, unavailable channels, and low disk space. Leave empty to disable notifications.</span>
+                        </span>
+                    </label>
+                    <input type="url" id="webhookUrl" class="form-input"
+                           placeholder="https://example.com/hooks/yt2rss">
+                    <div class="form-help">Generic JSON webhook (works with ntfy, Gotify, Discord relays, Home Assistant, etc.).</div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label" for="failureThreshold">Failure Threshold</label>
+                        <input type="number" id="failureThreshold" class="form-input"
+                               placeholder="3" min="1" max="100" step="1">
+                        <div class="form-help">Consecutive failed refreshes before notifying.</div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="cooldownMinutes">Cooldown (minutes)</label>
+                        <input type="number" id="cooldownMinutes" class="form-input"
+                               placeholder="360" min="0" max="10080" step="1">
+                        <div class="form-help">Minimum time between repeats of the same alert.</div>
+                    </div>
+                </div>
+                <div class="checkbox-group filter-checks">
+                    <div class="checkbox-item">
+                        <input type="checkbox" id="notifyLowSpace">
+                        <label for="notifyLowSpace">Notify about low disk space</label>
+                    </div>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" onclick="testNotification()">📨 Send Test</button>
+                    <button type="button" class="btn btn-secondary" onclick="saveNotificationSettings()">💾 Save Notifications</button>
                 </div>
 
                 <div class="schedule-info" id="scheduleInfo">

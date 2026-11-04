@@ -181,6 +181,7 @@ async function openScheduleModal() {
             document.getElementById('nextRun').textContent = nextRun;
 
             await populateStorageSettings();
+            await populateNotificationSettings();
             document.getElementById('scheduleModal').style.display = 'block';
         } else {
             showToast('❌ Failed to load scheduler settings');
@@ -1554,10 +1555,210 @@ async function refreshSingleChannel(channelName, button) {
     }
 }
 
+// ---------- Health monitoring and notifications ----------
+
+let healthPollTimer = null;
+
+function toggleHealthPanel() {
+    const content = document.getElementById('healthContent');
+    const toggle = document.getElementById('healthToggle');
+    if (!content) return;
+    const visible = content.style.display !== 'none';
+    content.style.display = visible ? 'none' : 'block';
+    if (toggle) toggle.textContent = visible ? '+' : '−';
+}
+
+function formatHealthTime(value) {
+    if (!value) return 'never';
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+}
+
+function healthRow(channelName, state) {
+    const row = document.createElement('div');
+    const failures = Number(state.consecutive_failures || 0);
+    row.className = 'health-row ' + (state.unavailable ? 'unavailable' : failures > 0 ? 'degraded' : 'healthy');
+
+    const name = document.createElement('span');
+    name.className = 'health-name';
+    name.textContent = channelName;
+
+    const status = document.createElement('span');
+    status.className = 'health-status';
+    if (state.unavailable) {
+        status.textContent = 'unavailable';
+    } else if (failures > 0) {
+        status.textContent = `${failures} consecutive failure(s)`;
+    } else {
+        status.textContent = 'healthy';
+    }
+
+    const detail = document.createElement('span');
+    detail.className = 'health-detail';
+    const parts = [`last success: ${formatHealthTime(state.last_success_at)}`];
+    if (state.last_failure_at) {
+        parts.push(`last failure: ${formatHealthTime(state.last_failure_at)}`);
+    }
+    detail.textContent = parts.join(' · ');
+    if (state.last_error) {
+        const error = document.createElement('span');
+        error.className = 'health-error';
+        error.textContent = state.last_error;
+        detail.appendChild(error);
+    }
+
+    row.append(name, status, detail);
+    return row;
+}
+
+async function refreshHealthPanel() {
+    const panel = document.getElementById('healthPanel');
+    const grid = document.getElementById('healthChannels');
+    if (!panel || !grid) return;
+    try {
+        const response = await fetch('/api/health');
+        if (!response.ok) return;
+        const data = await response.json();
+        const states = data.channels || {};
+        const names = Object.keys(states).sort();
+        const issues = (data.pending_events || []).length;
+
+        const summary = document.getElementById('healthSummary');
+        if (summary) {
+            summary.textContent = names.length === 0
+                ? 'no refreshes yet'
+                : issues === 0 ? 'all channels healthy' : `${issues} issue(s)`;
+            summary.className = 'health-summary ' + (issues === 0 ? 'healthy' : 'degraded');
+        }
+
+        const disk = document.getElementById('healthDisk');
+        if (disk) {
+            disk.textContent = '';
+            const free = data.disk && data.disk.free_bytes;
+            const minimum = data.disk && data.disk.min_free_space_gb;
+            if (Number.isFinite(free)) {
+                const freeGb = (free / (1024 ** 3)).toFixed(2);
+                disk.textContent = Number(minimum) > 0
+                    ? `Free disk space: ${freeGb} GB (minimum ${minimum} GB)`
+                    : `Free disk space: ${freeGb} GB`;
+                disk.className = 'health-disk' + (Number(minimum) > 0 && free < Number(minimum) * (1024 ** 3) ? ' low' : '');
+            } else {
+                disk.textContent = 'Free disk space: unavailable';
+            }
+        }
+
+        grid.textContent = '';
+        if (names.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'health-empty';
+            empty.textContent = 'No refresh history yet. Run a refresh to start tracking channel health.';
+            grid.appendChild(empty);
+        } else {
+            names.forEach(name => grid.appendChild(healthRow(name, states[name])));
+        }
+
+        const notifications = document.getElementById('healthNotifications');
+        if (notifications) {
+            notifications.textContent = '';
+            const settings = (data.notifications && data.notifications.settings) || {};
+            const line = document.createElement('div');
+            line.className = 'health-notification-line';
+            line.textContent = settings.webhook_url
+                ? 'Webhook configured · alerts: repeated failures, unavailable channels' + (settings.notify_low_space ? ', low disk space' : '')
+                : 'No webhook configured — alerts stay in this panel only.';
+            notifications.appendChild(line);
+            const lastError = data.notifications && data.notifications.last_error;
+            if (lastError) {
+                const error = document.createElement('div');
+                error.className = 'health-error';
+                error.textContent = `Last delivery error: ${lastError}`;
+                notifications.appendChild(error);
+            }
+            (data.pending_events || []).forEach(event => {
+                const pending = document.createElement('div');
+                pending.className = 'health-pending';
+                pending.textContent = `⚠️ ${event.message}`;
+                notifications.appendChild(pending);
+            });
+        }
+    } catch (error) {
+        console.error('Error loading health state:', error);
+    }
+}
+
+function startHealthPolling() {
+    clearInterval(healthPollTimer);
+    refreshHealthPanel();
+    healthPollTimer = setInterval(refreshHealthPanel, 15000);
+}
+
+async function runHealthCheck() {
+    try {
+        const response = await fetch('/api/health/check', { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Health check failed');
+        const events = (data.events || []).length;
+        showToast(events === 0 ? '✅ Health check: no issues' : `⚠️ Health check found ${events} issue(s)`);
+        refreshHealthPanel();
+    } catch (error) {
+        showToast('❌ ' + (error.message || 'Health check failed'));
+    }
+}
+
+async function populateNotificationSettings() {
+    try {
+        const response = await fetch('/api/config/notifications');
+        if (!response.ok) return;
+        const settings = await response.json();
+        document.getElementById('webhookUrl').value = settings.webhook_url || '';
+        document.getElementById('failureThreshold').value = settings.failure_threshold;
+        document.getElementById('cooldownMinutes').value = settings.cooldown_minutes;
+        document.getElementById('notifyLowSpace').checked = settings.notify_low_space !== false;
+    } catch (error) {
+        console.error('Error loading notification settings:', error);
+    }
+}
+
+async function saveNotificationSettings() {
+    const payload = {
+        webhook_url: document.getElementById('webhookUrl').value.trim(),
+        failure_threshold: parseInt(document.getElementById('failureThreshold').value) || 3,
+        cooldown_minutes: parseInt(document.getElementById('cooldownMinutes').value) || 0,
+        notify_low_space: document.getElementById('notifyLowSpace').checked,
+    };
+    try {
+        const response = await fetch('/api/config/notifications', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Failed to save notification settings');
+        showToast('✅ Notification settings saved');
+        refreshHealthPanel();
+    } catch (error) {
+        showToast('❌ ' + (error.message || 'Failed to save notification settings'));
+    }
+}
+
+async function testNotification() {
+    try {
+        const response = await fetch('/api/notifications/test', { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok || !data.ok) {
+            throw new Error((data.result && data.result.error) || data.error || 'Test notification failed');
+        }
+        showToast('✅ Test notification delivered');
+    } catch (error) {
+        showToast('❌ ' + (error.message || 'Test notification failed'));
+    }
+}
+
 // Check refresh status on page load
 document.addEventListener('DOMContentLoaded', function() {
     checkRefreshStatus();
     startQueuePolling();
+    startHealthPolling();
     refreshStoragePanel();
     setInterval(refreshStoragePanel, 30000);
     updateRelativeTimes();

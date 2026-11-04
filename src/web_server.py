@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from typing import Any, cast
@@ -50,6 +50,16 @@ try:
         DownloadQueue,
         QueueWorker,
         execute_queue_job,
+    )
+    from .health import (
+        ChannelUnavailableError,
+        collect_events,
+        dispatch_events,
+        health_summary,
+        load_notification_settings,
+        record_refresh,
+        remove_channel_health,
+        validate_notification_settings,
     )
     from .rss_generator import RSSGenerator
     from .storage import (
@@ -104,6 +114,16 @@ except ImportError:
         DownloadQueue,
         QueueWorker,
         execute_queue_job,
+    )
+    from health import (
+        ChannelUnavailableError,
+        collect_events,
+        dispatch_events,
+        health_summary,
+        load_notification_settings,
+        record_refresh,
+        remove_channel_health,
+        validate_notification_settings,
     )
     from rss_generator import RSSGenerator
     from storage import (
@@ -627,6 +647,20 @@ class YouTubePodcastServer:
                 next_run_time=datetime.now(),
             )
 
+            # Health evaluation runs hourly: repeated-failure and low-space
+            # notifications are cooldown-limited, so this is cheap and does
+            # not fire immediately on startup.
+            self.scheduler.add_job(
+                func=self._run_health_check,
+                trigger=IntervalTrigger(hours=1),
+                id="health_check",
+                name="Health check and notifications",
+                replace_existing=True,
+                misfire_grace_time=3600,
+                coalesce=True,
+                max_instances=1,
+            )
+
         except Exception as e:
             self.logger.error(f"Error setting up scheduler: {e}")
 
@@ -880,6 +914,32 @@ class YouTubePodcastServer:
             """Update refresh interval."""
             return self._handle_update_refresh_interval()
 
+        @self.app.route("/api/health", methods=["GET"])
+        def get_health():
+            """Per-channel refresh health and notification state."""
+            return self._handle_get_health()
+
+        @self.app.route("/api/health/check", methods=["POST"])
+        def check_health():
+            """Evaluate health now and deliver due notifications."""
+            return self._handle_check_health()
+
+        @self.app.route("/api/config/notifications", methods=["GET"])
+        def get_notification_settings():
+            """Return the effective notification settings."""
+            config = self._load_channel_config()
+            return jsonify(load_notification_settings(config))
+
+        @self.app.route("/api/config/notifications", methods=["PUT"])
+        def update_notification_settings():
+            """Validate and persist notification settings."""
+            return self._handle_update_notification_settings()
+
+        @self.app.route("/api/notifications/test", methods=["POST"])
+        def test_notification():
+            """Send a test event to the configured webhook."""
+            return self._handle_test_notification()
+
         @self.app.route("/api/storage", methods=["GET"])
         def get_storage():
             """Report media usage, quotas, retention and free disk space."""
@@ -1055,16 +1115,44 @@ class YouTubePodcastServer:
             )
             downloader.logger.addHandler(handler)
             for channel in channels:
+                channel_name = str(channel["name"])
+                started = time.monotonic()
                 try:
-                    self._discover_channel_jobs(downloader, channel, global_config)
-                    self._cleanup_old_episodes(channel["name"], channel["max_episodes"])
-                    self._apply_channel_retention(channel, global_config)
-                    self._add_log_message(f"Refresh completed for {channel['name']}")
-                except Exception as error:
-                    self.logger.error(f"Refresh failed for {channel['name']}: {error}")
-                    self._add_log_message(
-                        f"Refresh failed for {channel['name']}: {error}"
+                    queued = self._discover_channel_jobs(
+                        downloader, channel, global_config
                     )
+                    self._cleanup_old_episodes(channel_name, channel["max_episodes"])
+                    self._apply_channel_retention(channel, global_config)
+                    self._add_log_message(f"Refresh completed for {channel_name}")
+                    record_refresh(
+                        self.config_dir,
+                        channel_name,
+                        success=True,
+                        queued=queued,
+                        duration_seconds=time.monotonic() - started,
+                    )
+                except ChannelUnavailableError as error:
+                    self.logger.error(f"Channel unavailable: {channel_name}: {error}")
+                    self._add_log_message(f"Channel unavailable: {channel_name}")
+                    record_refresh(
+                        self.config_dir,
+                        channel_name,
+                        success=False,
+                        error=str(error),
+                        unavailable=True,
+                        duration_seconds=time.monotonic() - started,
+                    )
+                except Exception as error:
+                    self.logger.error(f"Refresh failed for {channel_name}: {error}")
+                    self._add_log_message(f"Refresh failed for {channel_name}: {error}")
+                    record_refresh(
+                        self.config_dir,
+                        channel_name,
+                        success=False,
+                        error=str(error),
+                        duration_seconds=time.monotonic() - started,
+                    )
+            self._dispatch_health_notifications()
         except Exception as error:
             self.logger.error(f"Refresh failed: {error}")
             self._add_log_message(f"Refresh failed: {error}")
@@ -1102,7 +1190,12 @@ class YouTubePodcastServer:
         self._add_log_message(f"Refresh started for {channel_name}")
         max_episodes = channel.get("max_episodes", 10)
         videos = downloader.get_channel_videos(channel["url"], max_episodes)
+        channel_error = getattr(downloader, "last_channel_error", None)
         if not videos:
+            if channel_error:
+                raise ChannelUnavailableError(
+                    f"Could not fetch channel data: {channel_error}"
+                )
             self._add_log_message(f"No videos found for {channel_name}")
             return 0
 
@@ -1312,6 +1405,173 @@ class YouTubePodcastServer:
             self.logger.error(f"Storage maintenance failed: {error}")
         finally:
             self._media_lock.release()
+
+    def _evaluate_health(self) -> tuple[list[dict[str, Any]], dict[str, Any], dict]:
+        """Collect due notification events plus the settings that produced them.
+
+        Returns:
+            ``(events, notification_settings, disk_state)`` where
+            ``disk_state`` carries ``free_bytes`` and ``min_free_space_gb``.
+        """
+        config = self._load_channel_config()
+        global_config = {
+            key: value for key, value in config.items() if key != "channels"
+        }
+        settings = load_notification_settings(global_config)
+        storage_settings = load_storage_settings(global_config)
+        min_free = storage_settings.get("min_free_space_gb", 0)
+        try:
+            free_bytes: int | None = free_disk_bytes(self.videos_dir)
+        except OSError as error:
+            self.logger.warning(f"Could not check free disk space: {error}")
+            free_bytes = None
+        events = collect_events(
+            self.config_dir,
+            settings,
+            free_bytes=free_bytes,
+            min_free_space_gb=min_free,
+        )
+        disk_state = {
+            "free_bytes": free_bytes,
+            "min_free_space_gb": min_free,
+        }
+        return events, settings, disk_state
+
+    def _dispatch_health_notifications(self, *, synchronous: bool = False) -> list:
+        """Evaluate health and deliver due webhook notifications.
+
+        Delivery is asynchronous by default so refreshes never wait for a
+        slow or unreachable webhook. Failures are recorded in
+        ``health.json`` and retried on the next evaluation.
+
+        Args:
+            synchronous: Deliver in the calling thread (management API).
+
+        Returns:
+            The due events; delivery results only when ``synchronous``.
+        """
+        try:
+            events, settings, _ = self._evaluate_health()
+            webhook_url = settings.get("webhook_url") or ""
+            if not events or not webhook_url:
+                return events if synchronous else []
+            if synchronous:
+                return dispatch_events(self.config_dir, events, webhook_url)
+            thread = threading.Thread(
+                target=dispatch_events,
+                args=(self.config_dir, events, webhook_url),
+                daemon=True,
+            )
+            thread.start()
+            return []
+        except Exception as error:
+            self.logger.error(f"Health notification evaluation failed: {error}")
+            return []
+
+    def _run_health_check(self) -> None:
+        """Periodic health evaluation scheduled once per hour."""
+        events, settings, _ = self._evaluate_health()
+        if not events:
+            return
+        if settings.get("webhook_url"):
+            self.logger.info(f"Dispatching {len(events)} health notification(s)")
+        else:
+            self.logger.warning(
+                f"{len(events)} health issue(s) detected; no webhook configured"
+            )
+        self._dispatch_health_notifications()
+
+    def _handle_get_health(self):
+        """Return per-channel health, notification state and pending events."""
+        try:
+            summary = health_summary(self.config_dir)
+            events, settings, disk_state = self._evaluate_health()
+            return jsonify(
+                {
+                    "channels": summary["channels"],
+                    "notifications": {
+                        "settings": settings,
+                        "last_sent": summary["notifications"].get("last_sent", {}),
+                        "last_attempts": summary["notifications"].get(
+                            "last_attempts", {}
+                        ),
+                        "last_error": summary["notifications"].get("last_error"),
+                    },
+                    "disk": disk_state,
+                    "pending_events": events,
+                }
+            ), 200
+        except Exception as error:
+            self.logger.error(f"Error reading health state: {error}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    @config_transaction
+    def _handle_update_notification_settings(self):
+        """Validate and persist notification settings."""
+        try:
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict) or not data:
+                return jsonify({"error": "No data provided"}), 400
+            validate_notification_settings(data)
+            config = self._load_channel_config()
+            current = load_notification_settings(config)
+            current.update(data)
+            validate_notification_settings(current)
+            config["notifications"] = current
+            if not self._save_channel_config(config):
+                return jsonify({"error": "Failed to save configuration"}), 500
+            return jsonify(
+                {"message": "Notification settings saved", "settings": current}
+            ), 200
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 400
+        except Exception as error:
+            self.logger.error(f"Error saving notification settings: {error}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    def _handle_check_health(self):
+        """Run a health evaluation now and deliver due notifications."""
+        try:
+            events, settings, disk_state = self._evaluate_health()
+            delivered: list = []
+            if events and settings.get("webhook_url"):
+                delivered = dispatch_events(
+                    self.config_dir, events, settings["webhook_url"]
+                )
+            return jsonify(
+                {
+                    "events": events,
+                    "delivered": delivered,
+                    "webhook_configured": bool(settings.get("webhook_url")),
+                    "disk": disk_state,
+                }
+            ), 200
+        except Exception as error:
+            self.logger.error(f"Error running health check: {error}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    def _handle_test_notification(self):
+        """Send a test event to the configured webhook."""
+        try:
+            config = self._load_channel_config()
+            settings = load_notification_settings(config)
+            webhook_url = settings.get("webhook_url") or ""
+            if not webhook_url:
+                return jsonify({"error": "No webhook URL configured"}), 400
+            event = {
+                "key": "test",
+                "event": "test",
+                "channel": None,
+                "message": "This is a test notification from yt2rss",
+                "occurred_at": datetime.now(UTC).isoformat(),
+            }
+            results = dispatch_events(self.config_dir, [event], webhook_url)
+            result = results[0] if results else {"ok": False, "error": "Not delivered"}
+            status = 200 if result.get("ok") else 502
+            return jsonify({"ok": bool(result.get("ok")), "result": result}), status
+        except Exception as error:
+            self.logger.error(f"Error sending test notification: {error}")
+            return jsonify({"error": "Internal server error"}), 500
 
     def _run_automation_script(self):
         """Run a reserved refresh for all channels."""
@@ -2008,10 +2268,11 @@ class YouTubePodcastServer:
             if self._save_channel_config(config):
                 # Restart scheduler to remove deleted channel's job
                 self._setup_scheduler()
-                # Pins and tombstones have no meaning once the channel is
-                # gone.
+                # Pins, tombstones and health state have no meaning once the
+                # channel is gone.
                 remove_channel_pins(self.config_dir, channel_name)
                 remove_channel_tombstones(self.config_dir, channel_name)
+                remove_channel_health(self.config_dir, channel_name)
 
                 return jsonify({"message": "Channel deleted successfully"}), 200
             else:

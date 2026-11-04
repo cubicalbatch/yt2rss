@@ -19,12 +19,30 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from .download_queue import DownloadQueue, QueueWorker, execute_queue_job
     from .downloader import YouTubeDownloader
-    from .storage import pinned_ids
+    from .health import (
+        ChannelUnavailableError,
+        collect_events,
+        dispatch_events,
+        load_notification_settings,
+        record_refresh,
+    )
+    from .storage import (
+        free_disk_bytes,
+        load_storage_settings,
+        pinned_ids,
+    )
     from .utils import cleanup_episodes, safe_component, validate_channel_settings
 except ImportError:
     from download_queue import DownloadQueue, QueueWorker, execute_queue_job
     from downloader import YouTubeDownloader
-    from storage import pinned_ids
+    from health import (
+        ChannelUnavailableError,
+        collect_events,
+        dispatch_events,
+        load_notification_settings,
+        record_refresh,
+    )
+    from storage import free_disk_bytes, load_storage_settings, pinned_ids
     from utils import cleanup_episodes, safe_component, validate_channel_settings
 
 
@@ -214,10 +232,16 @@ class AutomationRunner:
             f"\n🚀 ========== PROCESSING CHANNEL: {channel_name} =========="
         )
 
+        started = time.monotonic()
         try:
             # Download new videos
             self.logger.info("📥 Starting video download phase...")
             downloaded_count = self.downloader.process_channel(channel, global_config)
+            channel_error = getattr(self.downloader, "last_channel_error", None)
+            if downloaded_count == 0 and channel_error:
+                raise ChannelUnavailableError(
+                    f"Could not fetch channel data: {channel_error}"
+                )
 
             if downloaded_count > 0:
                 self.logger.info(
@@ -234,11 +258,70 @@ class AutomationRunner:
             # RSS feeds are now generated dynamically when requested
             self.logger.info("🎉 Channel processing successful!")
 
+            record_refresh(
+                self.config_path.parent,
+                str(channel_name),
+                success=True,
+                queued=downloaded_count,
+                duration_seconds=time.monotonic() - started,
+            )
             return True
 
+        except ChannelUnavailableError as e:
+            self.logger.error(f"❌ Channel unavailable {channel_name}: {e}")
+            record_refresh(
+                self.config_path.parent,
+                str(channel_name),
+                success=False,
+                error=str(e),
+                unavailable=True,
+                duration_seconds=time.monotonic() - started,
+            )
+            return False
         except Exception as e:
             self.logger.error(f"❌ Error processing channel {channel_name}: {e}")
+            record_refresh(
+                self.config_path.parent,
+                str(channel_name),
+                success=False,
+                error=str(e),
+                duration_seconds=time.monotonic() - started,
+            )
             return False
+
+    def notify_health(self, global_config: dict[str, Any]) -> None:
+        """Deliver due health notifications after a cron pass.
+
+        Cron deployments share ``health.json`` with the web server, so
+        repeated failures and low disk space alert through the same webhook
+        even when the web UI is not running.
+        """
+        try:
+            settings = load_notification_settings(global_config)
+            webhook_url = settings.get("webhook_url") or ""
+            storage_settings = load_storage_settings(global_config)
+            try:
+                free_bytes: int | None = free_disk_bytes(self.videos_dir)
+            except OSError as error:
+                self.logger.warning(f"Could not check free disk space: {error}")
+                free_bytes = None
+            events = collect_events(
+                self.config_path.parent,
+                settings,
+                free_bytes=free_bytes,
+                min_free_space_gb=storage_settings.get("min_free_space_gb", 0),
+            )
+            if not events:
+                return
+            if not webhook_url:
+                self.logger.warning(
+                    f"{len(events)} health issue(s) detected; no webhook configured"
+                )
+                return
+            self.logger.info(f"Dispatching {len(events)} health notification(s)")
+            dispatch_events(self.config_path.parent, events, webhook_url)
+        except Exception as error:
+            self.logger.error(f"Health notification dispatch failed: {error}")
 
     def run(self) -> int:
         """Main automation runner method"""
@@ -308,6 +391,8 @@ class AutomationRunner:
                 self.logger.warning(
                     "⚠️  Some channels had errors - check logs for details"
                 )
+
+            self.notify_health(global_config)
 
             return 0 if error_count == 0 else 1
 
