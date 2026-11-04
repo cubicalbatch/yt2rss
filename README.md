@@ -4,7 +4,7 @@ A self-hosted solution that converts YouTube channels into podcast RSS feeds. Su
 
 ## Features
 
-- **Automatic Video Downloads**: Monitor YouTube channels and download new videos in 720p MP4 format
+- **Automatic Downloads**: Monitor YouTube channels for video or M4A audio, with configurable video quality
 - **SponsorBlock Integration**: Automatically remove sponsored segments, self-promotion, and other unwanted content
 - **Podcast RSS Feeds**: Generate standard RSS feeds compatible with any podcast app
 - **Per-Channel Scheduling**: Individual refresh controls with configurable intervals for each channel
@@ -82,10 +82,22 @@ channels:
     max_episodes: 15
     download_delay_hours: 12
     refresh_interval_hours: 24  # Individual channel refresh interval
+    format: video              # video or audio
+    quality: max               # max, best, 480p, 720p, or 1080p
     sponsorblock_categories:
       - sponsor
       - selfpromo
 ```
+
+Refresh intervals can be fractional (for example, `0.5` for 30 minutes), up to
+8760 hours. Episode limits must be positive integers. The API validates settings
+before saving them. Configuration files are replaced atomically; a malformed
+existing file must be repaired before configuration changes can be saved.
+
+Manual and scheduled refreshes share one worker slot. Purge, delete, and
+redownload requests return HTTP 409 while a media operation is running. A failed
+redownload preserves the existing episode. Cleanup counts completed episodes and
+removes all supported media formats belonging to expired episodes.
 
 ### SponsorBlock Categories
 
@@ -122,7 +134,26 @@ For development or manual installation, this project uses UV for dependency mana
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install dependencies and run
-uv run python main.py
+uv sync --frozen
+uv run --frozen python main.py
+```
+
+Run the checks locally:
+
+```bash
+uv run --frozen pytest
+uv run --frozen ruff check .
+uv run --frozen ruff format --check .
+uv run --frozen pyright
+node --test tests/test_ui.cjs
+```
+
+`uv.lock` is the dependency source of truth. Docker installs the pinned, hashed
+runtime dependencies exported to `requirements.txt`. After updating dependencies,
+regenerate that file with:
+
+```bash
+uv export --frozen --no-dev --no-emit-project -o requirements.txt
 ```
 
 Requirements:
@@ -132,9 +163,15 @@ Requirements:
 
 ## Security Notes
 
-- Designed for local network use
-- No authentication required
-- All content served over HTTP
+- Designed for a trusted local network; the management API has no authentication.
+- Browser management requests must originate from the same origin. Feeds and
+  media remain available across origins for podcast clients. Command-line API
+  clients can continue to call the API without an `Origin` header.
+- The built-in server serves HTTP. Use an authenticated HTTPS reverse proxy for
+  remote access and configure `BASE_URL` to match the public address.
+- Run one web server process for a data directory so scheduling and configuration
+  edits stay coordinated. On POSIX systems, the web server and standalone cron
+  runner also share a file lock to prevent overlapping media operations.
 
 ## Contributing
 

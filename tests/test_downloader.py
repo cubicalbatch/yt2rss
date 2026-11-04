@@ -5,6 +5,7 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
+
 import pytest
 import yaml
 
@@ -289,6 +290,8 @@ class TestYouTubeDownloader:
         metadata_file = channel_dir / "video123.info.json"
         with open(metadata_file, "w") as f:
             json.dump(metadata, f)
+
+        (channel_dir / "video123.mp4").write_bytes(b"downloaded media")
 
         # Create mock thumbnail
         thumbnail_file = channel_dir / "video123.jpg"

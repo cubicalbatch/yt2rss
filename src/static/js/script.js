@@ -400,34 +400,53 @@ async function openEpisodesModal(channelName, displayName) {
         
         if (response.ok) {
             if (data.episodes && data.episodes.length > 0) {
-                // Display episodes
-                const episodesHtml = data.episodes.map(episode => `
-                    <div class="episode-item">
-                        <div class="episode-content">
-                            <div class="episode-header">
-                                <h3 class="episode-title">${escapeHtml(episode.title)}</h3>
-                                <div class="episode-meta">
-                                    <div class="episode-date">${episode.date}</div>
-                                    <div class="episode-duration">${episode.duration}</div>
-                                </div>
-                            </div>
-                            <div class="episode-description">${escapeHtml(episode.description)}</div>
-                        </div>
-                        <div class="episode-actions">
-                            <button class="play-btn" onclick="openEpisodeMedia('${channelName}', '${episode.id}', '${episode.file_extension || '.mp4'}')">▶️ Play</button>
-                            <button class="download-audio-btn" onclick="downloadAsMP3('${channelName}', '${episode.id}', '${episode.file_extension || '.mp4'}')">🎵 Download Audio</button>
-                            <button class="download-original-btn" onclick="downloadOriginalFile('${channelName}', '${episode.id}', '${episode.file_extension || '.mp4'}')">📁 Download Original</button>
-                            <button class="redownload-btn" onclick="redownloadEpisode('${channelName}', '${episode.id}', '${escapeHtml(episode.title)}')">🔄 Redownload</button>
-                            <button class="delete-btn" onclick="deleteEpisode('${channelName}', '${episode.id}', '${escapeHtml(episode.title)}')">🗑️ Delete</button>
-                        </div>
-                    </div>
-                `).join('');
-                
-                contentElement.innerHTML = `
-                    <div class="episodes-list">
-                        ${episodesHtml}
-                    </div>
-                `;
+                // Bind actions directly: titles and metadata are text, never JavaScript.
+                const list = document.createElement('div');
+                list.className = 'episodes-list';
+                for (const episode of data.episodes) {
+                    const item = document.createElement('div');
+                    item.className = 'episode-item';
+                    const content = document.createElement('div');
+                    content.className = 'episode-content';
+                    const header = document.createElement('div');
+                    header.className = 'episode-header';
+                    const title = document.createElement('h3');
+                    title.className = 'episode-title';
+                    title.textContent = episode.title;
+                    const meta = document.createElement('div');
+                    meta.className = 'episode-meta';
+                    for (const [className, value] of [['episode-date', episode.date], ['episode-duration', episode.duration]]) {
+                        const field = document.createElement('div');
+                        field.className = className;
+                        field.textContent = value;
+                        meta.append(field);
+                    }
+                    header.append(title, meta);
+                    const description = document.createElement('div');
+                    description.className = 'episode-description';
+                    description.textContent = episode.description;
+                    content.append(header, description);
+                    const actions = document.createElement('div');
+                    actions.className = 'episode-actions';
+                    const extension = episode.file_extension || '.mp4';
+                    const definitions = [
+                        ['play-btn', '▶️ Play', () => openEpisodeMedia(channelName, episode.id, extension)],
+                        ['download-audio-btn', '🎵 Download Audio', button => downloadAsMP3(channelName, episode.id, extension, button)],
+                        ['download-original-btn', '📁 Download Original', button => downloadOriginalFile(channelName, episode.id, extension, button)],
+                        ['redownload-btn', '🔄 Redownload', button => redownloadEpisode(channelName, episode.id, episode.title, button)],
+                        ['delete-btn', '🗑️ Delete', button => deleteEpisode(channelName, episode.id, episode.title, button)],
+                    ];
+                    for (const [className, label, action] of definitions) {
+                        const button = document.createElement('button');
+                        button.className = className;
+                        button.textContent = label;
+                        button.addEventListener('click', () => action(button));
+                        actions.append(button);
+                    }
+                    item.append(content, actions);
+                    list.append(item);
+                }
+                contentElement.replaceChildren(list);
             } else {
                 // No episodes found
                 contentElement.innerHTML = `
@@ -472,8 +491,7 @@ function openEpisodeMedia(channelName, episodeId, fileExtension) {
     window.open(mediaUrl, '_blank');
 }
 
-async function downloadAsMP3(channelName, episodeId, fileExtension) {
-    const button = event.target;
+async function downloadAsMP3(channelName, episodeId, fileExtension, button) {
     const originalText = button.textContent;
     
     try {
@@ -537,8 +555,7 @@ async function downloadAsMP3(channelName, episodeId, fileExtension) {
     }
 }
 
-async function downloadOriginalFile(channelName, episodeId, fileExtension) {
-    const button = event.target;
+async function downloadOriginalFile(channelName, episodeId, fileExtension, button) {
     const originalText = button.textContent;
     
     try {
@@ -602,8 +619,7 @@ async function downloadOriginalFile(channelName, episodeId, fileExtension) {
     }
 }
 
-async function deleteEpisode(channelName, episodeId, episodeTitle) {
-    const button = event.target;
+async function deleteEpisode(channelName, episodeId, episodeTitle, button) {
     const originalText = button.textContent;
 
     // Confirm deletion
@@ -666,12 +682,11 @@ async function deleteEpisode(channelName, episodeId, episodeTitle) {
     }
 }
 
-async function redownloadEpisode(channelName, episodeId, episodeTitle) {
-    const button = event.target;
+async function redownloadEpisode(channelName, episodeId, episodeTitle, button) {
     const originalText = button.textContent;
 
     // Confirm redownload
-    if (!confirm(`Redownload "${episodeTitle}"?\n\nThis will delete the current file and download it again.`)) {
+    if (!confirm(`Redownload "${episodeTitle}"?\n\nThe current file will be replaced after the download succeeds.`)) {
         return;
     }
 

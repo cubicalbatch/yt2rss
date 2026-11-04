@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 
+import argparse
+import fcntl
+import logging
 import os
 import sys
 import time
-import json
-import fcntl
-import logging
-import argparse
-from pathlib import Path
-from typing import List, Dict, Any
 from datetime import datetime
+from pathlib import Path
+from typing import Any
+
 import yaml
 
 # Add the src directory to Python path
@@ -18,15 +18,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Handle both relative and absolute imports
 try:
     from .downloader import YouTubeDownloader
+    from .utils import cleanup_episodes, safe_component, validate_channel_settings
 except ImportError:
     from downloader import YouTubeDownloader
+    from utils import cleanup_episodes, safe_component, validate_channel_settings
 
 
 class AutomationRunner:
     def __init__(self, base_dir: str = "."):
         self.base_dir = Path(base_dir)
         self.config_path = self.base_dir / "appdata" / "config" / "channels.yaml"
-        self.lock_file_path = self.base_dir / "cron_runner.lock"
+        self.lock_file_path = self.config_path.parent / "media.lock"
         self.videos_dir = self.base_dir / "appdata" / "podcasts"
 
         # Setup logging
@@ -58,29 +60,34 @@ class AutomationRunner:
     def acquire_lock(self) -> bool:
         """Acquire lock file to prevent concurrent runs"""
         try:
-            self.lock_file = open(self.lock_file_path, "w")
+            self.lock_file_path.parent.mkdir(parents=True, exist_ok=True)
+            self.lock_file = open(self.lock_file_path, "a+")
             fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.lock_file.seek(0)
+            self.lock_file.truncate()
             self.lock_file.write(f"{os.getpid()}\n")
             self.lock_file.flush()
             self.logger.info("Lock acquired successfully")
             return True
-        except (OSError, IOError) as e:
+        except OSError as e:
+            if hasattr(self, "lock_file") and not self.lock_file.closed:
+                self.lock_file.close()
             self.logger.warning(f"Could not acquire lock: {e}")
             return False
 
     def release_lock(self):
         """Release the lock file"""
         try:
-            if hasattr(self, "lock_file"):
+            if hasattr(self, "lock_file") and not self.lock_file.closed:
                 fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
                 self.lock_file.close()
-                if self.lock_file_path.exists():
-                    self.lock_file_path.unlink()
+                # Keep the inode: unlinking a lock lets another process lock a
+                # different file while an existing waiter holds the old inode.
                 self.logger.info("Lock released successfully")
         except Exception as e:
             self.logger.error(f"Error releasing lock: {e}")
 
-    def load_and_validate_config(self) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    def load_and_validate_config(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Load and validate configuration from channels.yaml"""
         try:
             if not self.config_path.exists():
@@ -112,8 +119,10 @@ class AutomationRunner:
             self.logger.error(f"Failed to load configuration: {e}")
             return [], {}
 
-    def validate_channel_config(self, channel: Dict[str, Any]) -> bool:
+    def validate_channel_config(self, channel: dict[str, Any]) -> bool:
         """Validate individual channel configuration"""
+        if not isinstance(channel, dict):
+            return False
         required_fields = ["name", "url", "max_episodes"]
 
         for field in required_fields:
@@ -121,101 +130,33 @@ class AutomationRunner:
                 self.logger.error(f"Missing required field '{field}' in channel config")
                 return False
 
+        try:
+            validate_channel_settings(channel)
+        except (ValueError, OverflowError):
+            return False
+        if not safe_component(channel["name"]):
+            return False
         if not isinstance(channel["max_episodes"], int) or channel["max_episodes"] <= 0:
             self.logger.error("max_episodes must be a positive integer")
             return False
 
-        if not channel["url"].startswith("https://www.youtube.com/"):
+        if not isinstance(channel["url"], str) or not channel["url"].startswith(
+            ("https://www.youtube.com/", "https://youtube.com/")
+        ):
             self.logger.error(f"Invalid YouTube URL: {channel['url']}")
             return False
 
         return True
 
     def cleanup_old_videos(self, channel_name: str, max_episodes: int):
-        """Remove oldest videos exceeding the limit"""
+        """Remove completed media files exceeding the configured limit."""
         try:
-            channel_dir = self.videos_dir / channel_name
-            if not channel_dir.exists():
-                self.logger.info("   📁 No channel directory found, skipping cleanup")
-                return
-
-            # Get all video files with their metadata
-            video_files = []
-            for json_file in channel_dir.glob("*.json"):
-                try:
-                    with open(json_file, "r") as f:
-                        metadata = json.load(f)
-                    video_id = metadata["id"]
-                    upload_date = metadata.get("upload_date", "19700101")
-                    video_files.append((upload_date, video_id, json_file))
-                except Exception as e:
-                    self.logger.warning(f"Error reading metadata from {json_file}: {e}")
-                    continue
-
-            self.logger.info(
-                f"   📊 Found {len(video_files)} episodes in channel directory"
-            )
-            self.logger.info(f"   🎯 Max episodes allowed: {max_episodes}")
-
-            # Sort by upload date (oldest first)
-            video_files.sort(key=lambda x: x[0])
-
-            # Remove excess videos
-            if len(video_files) > max_episodes:
-                videos_to_remove = video_files[:-max_episodes]
-                self.logger.info(
-                    f"   🗑️  Need to remove {len(videos_to_remove)} old episodes"
-                )
-
-                for upload_date, video_id, json_file in videos_to_remove:
-                    try:
-                        # Remove video file
-                        video_file = channel_dir / f"{video_id}.mp4"
-                        audio_file = (
-                            channel_dir / f"{video_id}.m4a"
-                        )  # Check for audio files too
-
-                        removed_files = []
-                        if video_file.exists():
-                            video_file.unlink()
-                            removed_files.append("video")
-                            self.logger.info(f"Removed old video: {video_file}")
-
-                        if audio_file.exists():
-                            audio_file.unlink()
-                            removed_files.append("audio")
-                            self.logger.info(f"Removed old audio: {audio_file}")
-
-                        # Remove JSON metadata
-                        if json_file.exists():
-                            json_file.unlink()
-                            removed_files.append("metadata")
-                            self.logger.info(f"Removed metadata: {json_file}")
-
-                        # Remove thumbnail
-                        thumbnails_dir = channel_dir / "thumbnails"
-                        thumbnail_removed = False
-                        for thumb_file in thumbnails_dir.glob(f"{video_id}.*"):
-                            thumb_file.unlink()
-                            thumbnail_removed = True
-                            self.logger.info(f"Removed thumbnail: {thumb_file}")
-                        if thumbnail_removed:
-                            removed_files.append("thumbnail")
-
-                        self.logger.info(
-                            f"     🗑️  Removed {video_id}: {', '.join(removed_files)}"
-                        )
-
-                    except Exception as e:
-                        self.logger.error(f"     ❌ Error removing {video_id}: {e}")
-            else:
-                self.logger.info("   ✅ No cleanup needed (within episode limit)")
-
-        except Exception as e:
-            self.logger.error(f"   ❌ Error during cleanup for {channel_name}: {e}")
+            cleanup_episodes(self.videos_dir, channel_name, max_episodes)
+        except Exception as error:
+            self.logger.error(f"Error cleaning up {channel_name}: {error}")
 
     def process_channel(
-        self, channel: Dict[str, Any], global_config: Dict[str, Any]
+        self, channel: dict[str, Any], global_config: dict[str, Any]
     ) -> bool:
         """Process a single channel: download videos and generate RSS feed"""
         channel_name = channel["name"]

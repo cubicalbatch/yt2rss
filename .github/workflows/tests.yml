@@ -25,7 +25,23 @@ jobs:
         run: uv python install
 
       - name: Install dependencies
-        run: uv sync --all-extras --dev
+        run: uv sync --frozen --all-extras --dev
 
       - name: Run tests
-        run: uv run pytest tests
+        run: uv run --frozen pytest tests
+
+      - name: Check Python formatting and lint
+        run: |
+          uv run --frozen ruff format --check .
+          uv run --frozen ruff check .
+
+      - name: Check types
+        run: uv run --frozen pyright
+
+      - name: Test browser rendering and actions
+        run: node --test tests/test_ui.cjs
+
+      - name: Verify Docker dependencies match lockfile
+        run: |
+          uv export --frozen --no-dev --no-emit-project -o /tmp/requirements.txt
+          diff requirements.txt /tmp/requirements.txt --ignore-matching-lines='^#'

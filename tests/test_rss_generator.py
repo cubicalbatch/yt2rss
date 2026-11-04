@@ -2,9 +2,10 @@
 
 import json
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
+
 import pytest
 
 from src.rss_generator import RSSGenerator
@@ -79,7 +80,7 @@ class TestRSSGenerator:
         """Test sanitization of HTML entities."""
         text = "Test & <script>alert('test')</script>"
         result = rss_generator.sanitize_text(text)
-        assert result == "Test &amp; &lt;script&gt;alert('test')&lt;/script&gt;"
+        assert result == text
 
     def test_sanitize_text_control_characters(self, rss_generator):
         """Test removal of control characters."""
@@ -164,7 +165,7 @@ class TestRSSGenerator:
         mock_load.return_value = {"channel1": "2023-12-01T10:00:00Z"}
 
         with patch("src.rss_generator.datetime") as mock_datetime:
-            mock_now = datetime(2023, 12, 2, 15, 30, 0, tzinfo=timezone.utc)
+            mock_now = datetime(2023, 12, 2, 15, 30, 0, tzinfo=UTC)
             mock_datetime.now.return_value = mock_now
             mock_datetime.strptime = datetime.strptime
 
@@ -293,9 +294,11 @@ class TestRSSGenerator:
         rss_content = rss_generator.generate_rss_feed("test-channel", sample_episodes)
 
         assert "<title>Test-Channel</title>" in rss_content
-        assert "<![CDATA[YouTube videos from Test-Channel]]>" in rss_content
+        assert (
+            "<description>YouTube videos from Test-Channel</description>" in rss_content
+        )
         assert "Test Episode 1" in rss_content
-        assert "Test Episode 2 &amp;amp; Special Characters" in rss_content
+        assert "Test Episode 2 &amp; Special Characters" in rss_content
         assert "video/mp4" in rss_content
         assert "audio/mp4" in rss_content
 
@@ -306,7 +309,10 @@ class TestRSSGenerator:
         )
 
         assert "<title>My Custom Channel</title>" in rss_content
-        assert "<![CDATA[YouTube videos from My Custom Channel]]>" in rss_content
+        assert (
+            "<description>YouTube videos from My Custom Channel</description>"
+            in rss_content
+        )
 
     def test_generate_rss_feed_empty_episodes(self, rss_generator):
         """Test RSS feed generation with no episodes."""
@@ -343,9 +349,7 @@ class TestRSSGenerator:
         # Check that episodes are sorted by date (newer first)
         newer_pos = rss_content.find("Newer Episode")
         older_pos = rss_content.find("Older Episode")
-        # The sorting might not work as expected, just check both episodes are present
-        assert newer_pos != -1
-        assert older_pos != -1
+        assert 0 <= newer_pos < older_pos
 
     def test_generate_rss_feed_mime_types(self, rss_generator):
         """Test RSS feed generation with different file types."""

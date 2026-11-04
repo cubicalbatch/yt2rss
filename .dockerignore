@@ -1,4 +1,9 @@
 venv/
+.venv/
+appdata/
+mockup/
+test_download.*
+.ruff_cache/
 .git/
 __pycache__/
 *.pyc

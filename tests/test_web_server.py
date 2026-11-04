@@ -5,9 +5,10 @@ Tests all Flask routes without calling YouTube directly.
 Uses dummy data based on real episode format from casually_explained.
 """
 
-import pytest
 import json
 from unittest.mock import Mock, patch
+
+import pytest
 import yaml
 
 from src.web_server import YouTubePodcastServer
@@ -526,21 +527,20 @@ class TestErrorHandling:
         response = client.post(
             "/api/channels", data="invalid json", content_type="application/json"
         )
-        # Flask returns 500 for malformed JSON, but our handler should catch it
-        assert response.status_code in [400, 500]
+        assert response.status_code == 400
 
     def test_empty_request_body(self, client):
         """Test requests with empty body."""
         response = client.post("/api/channels", content_type="application/json")
-        # Flask may return 500 for empty JSON, but our handler should catch it
-        assert response.status_code in [400, 500]
+        assert response.status_code == 400
         if response.status_code == 400:
             data = json.loads(response.data)
             assert "No data provided" in data["error"]
 
     def test_cors_headers(self, client):
         """Test CORS headers are present in responses."""
-        response = client.get("/api/channels")
+        assert "Access-Control-Allow-Origin" not in client.get("/api/channels").headers
+        response = client.get("/feeds/test_channel")
         assert "Access-Control-Allow-Origin" in response.headers
         assert response.headers["Access-Control-Allow-Origin"] == "*"
 

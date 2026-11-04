@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-from src.web_server import YouTubePodcastServer
 import os
 import sys
-
 from pathlib import Path
+
+from src.web_server import YouTubePodcastServer
 
 # Add src to path and run from project root
 sys.path.insert(0, str(Path(__file__).parent / "src"))

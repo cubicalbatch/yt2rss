@@ -5,11 +5,12 @@ Tests the AutomationRunner class without calling yt-dlp.
 Only includes tests that work reliably.
 """
 
-import pytest
 import json
-import yaml
 from pathlib import Path
-from unittest.mock import Mock, patch, mock_open
+from unittest.mock import Mock, mock_open, patch
+
+import pytest
+import yaml
 
 from src.cron_runner import AutomationRunner
 

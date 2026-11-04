@@ -2,28 +2,47 @@ import json
 import logging
 import os
 import time
-from pathlib import Path
-from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
-import yt_dlp
-import yaml
-from PIL import Image
+from pathlib import Path
+from typing import Any, cast
 
+import yaml
+import yt_dlp
+from PIL import Image
 
 # Handle both relative and absolute imports
 try:
     from .rss_generator import RSSGenerator
+    from .utils import (
+        contained_path,
+        safe_component,
+        save_json_file,
+        validate_channel_settings,
+    )
 except ImportError:
     from rss_generator import RSSGenerator
+    from utils import (
+        contained_path,
+        safe_component,
+        save_json_file,
+        validate_channel_settings,
+    )
 
 
 class YouTubeDownloader:
     def __init__(
-        self, config_path: str = "appdata/config/channels.yaml", base_dir: str = "."
+        self,
+        config_path: str = "appdata/config/channels.yaml",
+        base_dir: str = ".",
+        videos_dir: str | None = None,
     ):
         self.config_path = config_path
         self.base_dir = Path(base_dir)
-        self.videos_dir = self.base_dir / "appdata" / "podcasts"
+        self.videos_dir = (
+            Path(videos_dir)
+            if videos_dir is not None
+            else self.base_dir / "appdata" / "podcasts"
+        )
 
         # Ensure directories exist
         self.videos_dir.mkdir(parents=True, exist_ok=True)
@@ -38,8 +57,11 @@ class YouTubeDownloader:
 
         # Initialize RSS generator for timestamp updates
         self.rss_generator = RSSGenerator()
+        self.rss_generator.refresh_timestamps_file = (
+            Path(config_path).resolve().parent / "refresh_timestamps.json"
+        )
 
-    def _get_proxy_opts(self) -> Dict[str, str]:
+    def _get_proxy_opts(self) -> dict[str, str]:
         """Get proxy configuration from environment variables.
 
         Returns a dictionary with proxy settings for yt-dlp if YT_DLP_PROXY is set.
@@ -53,11 +75,13 @@ class YouTubeDownloader:
         """
         proxy_url = os.getenv("YT_DLP_PROXY")
         if proxy_url:
-            self.logger.info(f"🔐 Using proxy: {proxy_url.split('@')[-1]}")  # Don't log credentials
+            self.logger.info(
+                f"🔐 Using proxy: {proxy_url.split('@')[-1]}"
+            )  # Don't log credentials
             return {"proxy": proxy_url}
         return {}
 
-    def load_config(self) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    def load_config(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Load channel configuration from YAML file."""
         try:
             with open(self.config_path, "r") as f:
@@ -71,7 +95,7 @@ class YouTubeDownloader:
 
     def get_channel_videos(
         self, channel_url: str, max_episodes: int = 10
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Get video information from a YouTube channel."""
         self.logger.info(
             f"📡 Fetching video list from channel (max {max_episodes} episodes)..."
@@ -86,7 +110,7 @@ class YouTubeDownloader:
         }
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(cast(Any, ydl_opts)) as ydl:
                 info = ydl.extract_info(channel_url, download=False)
 
                 if not info or "entries" not in info:
@@ -97,7 +121,11 @@ class YouTubeDownloader:
 
                 videos = []
                 for entry in info["entries"] if info else []:
-                    if entry:
+                    if (
+                        entry
+                        and isinstance(entry, dict)
+                        and safe_component(entry.get("id"))
+                    ):
                         videos.append(
                             {
                                 "id": entry.get("id"),
@@ -115,7 +143,7 @@ class YouTubeDownloader:
             self.logger.error(f"Failed to get channel videos: {e}")
             return []
 
-    def get_video_metadata(self, video_url: str) -> Dict[str, Any]:
+    def get_video_metadata(self, video_url: str) -> dict[str, Any]:
         """Get detailed metadata for a single video."""
         ydl_opts = {
             "quiet": True,
@@ -124,13 +152,14 @@ class YouTubeDownloader:
         }
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(cast(Any, ydl_opts)) as ydl:
                 info = ydl.extract_info(video_url, download=False)
                 if info:
                     return {
                         "id": info.get("id"),
                         "title": info.get("title"),
                         "upload_date": info.get("upload_date"),
+                        "timestamp": info.get("timestamp"),
                         "duration": info.get("duration"),
                         "url": video_url,
                     }
@@ -144,24 +173,28 @@ class YouTubeDownloader:
         self, channel_name: str, video_id: str, format_type: str = "video"
     ) -> bool:
         """Check if video has already been downloaded."""
-        channel_dir = self.videos_dir / channel_name
-
-        # Check for different file extensions based on format
-        if format_type == "audio":
-            video_file = channel_dir / f"{video_id}.m4a"
-        else:
-            video_file = channel_dir / f"{video_id}.mp4"
-
-        metadata_file = channel_dir / f"{video_id}.json"
-
-        return video_file.exists() and metadata_file.exists()
+        channel_dir = contained_path(self.videos_dir, channel_name)
+        extensions = (
+            (".m4a", ".mp3")
+            if format_type == "audio"
+            else (".mp4", ".webm", ".mkv", ".avi")
+        )
+        metadata_file = contained_path(channel_dir, f"{video_id}.json")
+        return metadata_file.is_file() and any(
+            contained_path(channel_dir, f"{video_id}{ext}").is_file()
+            for ext in extensions
+        )
 
     def is_video_too_new(
-        self, video_info: Dict[str, Any], download_delay_hours: int
+        self, video_info: dict[str, Any], download_delay_hours: int
     ) -> bool:
         """Check if video is too new based on download_delay_hours."""
         if download_delay_hours <= 0:
             return False
+
+        timestamp = video_info.get("timestamp")
+        if isinstance(timestamp, (int, float)) and timestamp > 0:
+            return time.time() - timestamp < download_delay_hours * 3600
 
         upload_date_str = video_info.get("upload_date")
         if not upload_date_str:
@@ -185,14 +218,17 @@ class YouTubeDownloader:
 
     def download_video(
         self,
-        video_info: Dict[str, Any],
+        video_info: dict[str, Any],
         channel_name: str,
-        sponsorblock_categories: Optional[List[str]] = None,
+        sponsorblock_categories: list[str] | None = None,
         format_type: str = "video",
         quality: str = "max",
     ) -> bool:
         """Download a single video with SponsorBlock integration."""
         video_id = video_info["id"]
+        if not safe_component(video_id) or not safe_component(channel_name):
+            self.logger.error("Invalid channel or video identifier")
+            return False
         video_url = video_info["url"]
         video_title = video_info.get("title", "Unknown Title")
 
@@ -207,28 +243,25 @@ class YouTubeDownloader:
             )
 
         # Create channel directory
-        channel_dir = self.videos_dir / channel_name
+        channel_dir = contained_path(self.videos_dir, channel_name)
         channel_dir.mkdir(exist_ok=True)
 
         # Create thumbnails subdirectory
-        thumbnails_dir = channel_dir / "thumbnails"
+        thumbnails_dir = contained_path(channel_dir, "thumbnails")
         thumbnails_dir.mkdir(exist_ok=True)
+        existing_files = set(channel_dir.glob(f"{video_id}.*")) | set(
+            thumbnails_dir.glob(f"{video_id}.*")
+        )
 
-        # Configure format string based on format_type and quality
         if format_type == "audio":
             format_string = "bestaudio[ext=m4a]/bestaudio"
-            self.logger.info(f"   🎵 Audio format selected: {format_string}")
-        else:  # video
-            if quality == "480p":
-                format_string = "best[height<=480][ext=mp4]/best[height<=480]/best"
-                self.logger.info(
-                    f"   📹 Video format selected: 480p (format: {format_string})"
-                )
-            else:  # max quality
-                format_string = "best"
-                self.logger.info(
-                    f"   📹 Video format selected: max quality (format: {format_string})"
-                )
+        else:
+            limit = (
+                f"[height<={quality[:-1]}]"
+                if quality in ("480p", "720p", "1080p")
+                else ""
+            )
+            format_string = f"bestvideo{limit}[ext=mp4]+bestaudio[ext=m4a]/best{limit}[ext=mp4]/best{limit}"
 
         # Configure yt-dlp options
         ydl_opts = {
@@ -239,6 +272,9 @@ class YouTubeDownloader:
             "writedescription": False,
             "writesubtitles": False,
             "writeautomaticsub": False,
+            "noplaylist": True,
+            "socket_timeout": 30,
+            "merge_output_format": "mp4",
             **self._get_proxy_opts(),
         }
 
@@ -257,11 +293,37 @@ class YouTubeDownloader:
                 },
             ]
 
+        if format_type == "audio":
+            ydl_opts.setdefault("postprocessors", []).append(
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "m4a",
+                }
+            )
+
         try:
             self.logger.info("   ⬇️  Downloading video file...")
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([video_url])
+            with yt_dlp.YoutubeDL(cast(Any, ydl_opts)) as ydl:
+                result = ydl.download([video_url])
+                if isinstance(result, int) and result != 0:
+                    raise RuntimeError("yt-dlp reported a download failure")
+
+            expected_extensions = (
+                (".m4a", ".mp3")
+                if format_type == "audio"
+                else (".mp4", ".webm", ".mkv", ".avi")
+            )
+            media_file = next(
+                (
+                    channel_dir / f"{video_id}{ext}"
+                    for ext in expected_extensions
+                    if (channel_dir / f"{video_id}{ext}").is_file()
+                ),
+                None,
+            )
+            if media_file is None or media_file.stat().st_size == 0:
+                raise RuntimeError("Download produced no usable media file")
 
             self.logger.info("   ✅ Video download completed")
 
@@ -314,6 +376,8 @@ class YouTubeDownloader:
 
             # Load and enhance metadata
             metadata_file = channel_dir / f"{video_id}.info.json"
+            if not metadata_file.is_file():
+                raise RuntimeError("Download produced no metadata")
             if metadata_file.exists():
                 with open(metadata_file, "r") as f:
                     metadata = json.load(f)
@@ -328,15 +392,17 @@ class YouTubeDownloader:
                     "thumbnail": f"thumbnails/{video_id}{final_thumbnail_ext}"
                     if final_thumbnail_ext
                     else None,
-                    "file_size": metadata.get("filesize", 0),
+                    "file_size": media_file.stat().st_size,
+                    "file_extension": media_file.suffix,
+                    "timestamp": metadata.get("timestamp"),
                     "uploader": metadata.get("uploader"),
                     "view_count": metadata.get("view_count", 0),
                 }
 
                 # Save simplified metadata
                 simple_metadata_file = channel_dir / f"{video_id}.json"
-                with open(simple_metadata_file, "w") as f:
-                    json.dump(simplified_metadata, f, indent=2)
+                if not save_json_file(simplified_metadata, str(simple_metadata_file)):
+                    raise OSError("Could not save episode metadata")
 
                 # Remove the detailed info.json file
                 metadata_file.unlink()
@@ -353,6 +419,8 @@ class YouTubeDownloader:
             for partial in list(channel_dir.glob(f"{video_id}.*")) + list(
                 thumbnails_dir.glob(f"{video_id}.*")
             ):
+                if partial in existing_files:
+                    continue
                 try:
                     partial.unlink()
                     self.logger.info(f"   🧹 Removed partial file: {partial.name}")
@@ -364,10 +432,19 @@ class YouTubeDownloader:
             return False
 
     def process_channel(
-        self, channel_config: Dict[str, Any], global_config: Dict[str, Any]
+        self, channel_config: dict[str, Any], global_config: dict[str, Any]
     ) -> int:
         """Process a single channel configuration."""
+        validate_channel_settings(channel_config)
+        validate_channel_settings(
+            {
+                key: value
+                for key, value in global_config.items()
+                if key in ("download_delay_seconds", "check_delay_seconds")
+            }
+        )
         channel_name = channel_config["name"]
+        contained_path(self.videos_dir, channel_name)
         channel_url = channel_config["url"]
         max_episodes = channel_config.get("max_episodes", 10)
         sponsorblock_categories = channel_config.get("sponsorblock_categories", [])

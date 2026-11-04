@@ -1,40 +1,83 @@
-import os
+import atexit
+import json
+import logging
 import mimetypes
-import yaml
+import os
+import re
 import subprocess
 import threading
 import time
-import json
-import atexit
-import re
-import logging
-from pathlib import Path
-from typing import Optional, Tuple, List
+from collections.abc import Callable
 from datetime import datetime
-import yt_dlp
+from functools import wraps
+from pathlib import Path
+from typing import Any, cast
+from urllib.parse import urlsplit
 
-from flask import Flask, Response, request, send_file, render_template, abort, jsonify
-from werkzeug.utils import secure_filename
+import yaml
+import yt_dlp
+from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from apscheduler.executors.pool import ThreadPoolExecutor
+from flask import Flask, Response, abort, jsonify, render_template, request, send_file
+from yt_dlp.utils import DownloadError
 
 try:
-    from .utils import (
-        setup_logging,
-        get_video_files,
-        sanitize_channel_name,
-        ensure_directory,
-    )
     from .rss_generator import RSSGenerator
-except ImportError:
-    from utils import (
-        setup_logging,
-        get_video_files,
-        sanitize_channel_name,
+    from .utils import (
+        MEDIA_EXTENSIONS,
+        MediaLock,
+        atomic_write_text,
+        cleanup_episodes,
+        contained_path,
         ensure_directory,
+        get_video_files,
+        safe_component,
+        sanitize_channel_name,
+        setup_logging,
+        validate_channel_settings,
     )
+except ImportError:
     from rss_generator import RSSGenerator
+    from utils import (
+        MEDIA_EXTENSIONS,
+        MediaLock,
+        atomic_write_text,
+        cleanup_episodes,
+        contained_path,
+        ensure_directory,
+        get_video_files,
+        safe_component,
+        sanitize_channel_name,
+        setup_logging,
+        validate_channel_settings,
+    )
+
+
+def config_transaction(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Serialize configuration read-modify-write operations in this server."""
+
+    @wraps(method)
+    def wrapped(self: "YouTubePodcastServer", *args: Any, **kwargs: Any) -> Any:
+        with self._config_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
+def exclusive_media_operation(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Prevent destructive media operations from racing with downloads."""
+
+    @wraps(method)
+    def wrapped(self: "YouTubePodcastServer", *args: Any, **kwargs: Any) -> Any:
+        if not self._media_lock.acquire(blocking=False):
+            return jsonify({"error": "A media operation is already in progress"}), 409
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._media_lock.release()
+
+    return wrapped
 
 
 class UILogHandler(logging.Handler):
@@ -73,6 +116,10 @@ class YouTubePodcastServer:
         self.config_dir = Path(config_dir).resolve()
         self.logger = setup_logging()
 
+        self._config_lock = threading.RLock()
+        self._state_lock = threading.Lock()
+        self._media_lock = MediaLock(self.config_dir / "media.lock")
+
         # Refresh state tracking
         self.refresh_status = {"running": False, "start_time": None, "duration": 0}
 
@@ -86,18 +133,24 @@ class YouTubePodcastServer:
         }
         self.scheduler = BackgroundScheduler(executors=executors)
         self.scheduler.start()
-        atexit.register(lambda: self.scheduler.shutdown())
+        atexit.register(self.close)
 
         # Start automatic refresh schedule
         self._setup_scheduler()
 
         # Initialize Flask app with templates and static folders
         self.app = Flask(__name__, template_folder="templates", static_folder="static")
+        self.app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
         self._setup_custom_filters()
         self._setup_routes()
 
         # Enable MIME type for MP4 files
         mimetypes.add_type("video/mp4", ".mp4")
+
+    def close(self) -> None:
+        """Stop the scheduler once, including during interpreter shutdown."""
+        if self.scheduler.running:
+            self.scheduler.shutdown()
 
     def _get_proxy_opts(self) -> dict:
         """Get proxy configuration from environment variables.
@@ -113,7 +166,9 @@ class YouTubePodcastServer:
         """
         proxy_url = os.getenv("YT_DLP_PROXY")
         if proxy_url:
-            self.logger.info(f"🔐 Using proxy: {proxy_url.split('@')[-1]}")  # Don't log credentials
+            self.logger.info(
+                f"🔐 Using proxy: {proxy_url.split('@')[-1]}"
+            )  # Don't log credentials
             return {"proxy": proxy_url}
         return {}
 
@@ -165,7 +220,21 @@ class YouTubePodcastServer:
 
         try:
             with open(config_file, "r") as f:
-                config = yaml.safe_load(f)
+                config = yaml.safe_load(f) or {}
+                if not isinstance(config, dict) or not isinstance(
+                    config.get("channels", []), list
+                ):
+                    raise ValueError(
+                        "Configuration must be a mapping with a channels list"
+                    )
+                for channel in config.get("channels", []):
+                    if not isinstance(channel, dict) or not safe_component(
+                        channel.get("name")
+                    ):
+                        raise ValueError(
+                            "Each channel must have a safe filesystem name"
+                        )
+                    contained_path(self.videos_dir, channel["name"])
                 # Handle backwards compatibility: rename refresh_interval_hours to default_interval_hours
                 if (
                     "refresh_interval_hours" in config
@@ -181,7 +250,9 @@ class YouTubePodcastServer:
                 return config
         except Exception as e:
             self.logger.error(f"Error loading config: {e}")
-            return {"channels": [], "default_interval_hours": 24}
+            raise ValueError(
+                "Cannot read channels.yaml; repair it before making changes"
+            ) from e
 
     def _setup_scheduler(self):
         """Setup per-channel automatic refresh scheduler based on config."""
@@ -208,7 +279,7 @@ class YouTubePodcastServer:
 
                 # Add job for this channel
                 self.scheduler.add_job(
-                    func=self._run_single_channel_refresh,
+                    func=self._scheduled_channel_refresh,
                     args=[channel_name],
                     trigger=IntervalTrigger(hours=interval_hours),
                     id=job_id,
@@ -226,7 +297,8 @@ class YouTubePodcastServer:
         except Exception as e:
             self.logger.error(f"Error setting up scheduler: {e}")
 
-    def _restart_scheduler(self, new_default_interval_hours: int):
+    @config_transaction
+    def _restart_scheduler(self, new_default_interval_hours: float):
         """Restart scheduler with new default interval."""
         try:
             # Update config with new default interval
@@ -256,8 +328,10 @@ class YouTubePodcastServer:
 
         config_file = self.config_dir / "channels.yaml"
         try:
-            with open(config_file, "w") as f:
-                yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+            atomic_write_text(
+                config_file,
+                yaml.safe_dump(config, default_flow_style=False, sort_keys=False),
+            )
             return True
         except Exception as e:
             self.logger.error(f"Error saving config: {e}")
@@ -288,6 +362,64 @@ class YouTubePodcastServer:
 
     def _setup_routes(self):
         """Setup Flask routes."""
+
+        @self.app.before_request
+        def validate_request() -> tuple[Response, int] | None:
+            """Reject unsafe paths and browser requests from another origin."""
+            arguments = request.view_args or {}
+            try:
+                for field in ("channel_name", "episode_id", "filename"):
+                    if field in arguments and not safe_component(arguments[field]):
+                        abort(404)
+                if "channel_name" in arguments:
+                    channel_dir = contained_path(
+                        self.videos_dir, arguments["channel_name"]
+                    )
+                    # Check existing descendants as well as the channel directory.
+                    if "episode_id" in arguments:
+                        episode_id = arguments["episode_id"]
+                        for ext in (*MEDIA_EXTENSIONS, ".json"):
+                            contained_path(channel_dir, f"{episode_id}{ext}")
+                        contained_path(channel_dir, "thumbnails")
+                    if "filename" in arguments:
+                        parts = [arguments["filename"]]
+                        if request.endpoint == "serve_thumbnail":
+                            parts.insert(0, "thumbnails")
+                        contained_path(channel_dir, *parts)
+            except ValueError:
+                abort(404)
+
+            if request.path.startswith("/api/") and request.method not in (
+                "GET",
+                "HEAD",
+                "OPTIONS",
+            ):
+                origin = request.headers.get("Origin")
+                allowed_origins = {request.host_url.rstrip("/")}
+                configured_url = os.getenv("BASE_URL")
+                if configured_url:
+                    parsed = urlsplit(configured_url)
+                    allowed_origins.add(f"{parsed.scheme}://{parsed.netloc}")
+                if (origin and origin not in allowed_origins) or request.headers.get(
+                    "Sec-Fetch-Site"
+                ) in ("cross-site", "same-site"):
+                    return jsonify(
+                        {"error": "Cross-origin API changes are not allowed"}
+                    ), 403
+                if request.endpoint in (
+                    "add_channel",
+                    "update_channel",
+                    "update_refresh_interval",
+                ):
+                    data = request.get_json(silent=True)
+                    if not isinstance(data, dict) or not data:
+                        return jsonify(
+                            {"error": "No data provided; expected a JSON object"}
+                        ), 400
+                    try:
+                        validate_channel_settings(data)
+                    except (ValueError, OverflowError) as error:
+                        return jsonify({"error": str(error)}), 400
 
         @self.app.route("/")
         def index():
@@ -399,287 +531,110 @@ class YouTubePodcastServer:
 
         @self.app.after_request
         def after_request(response):
-            """Add CORS headers for compatibility."""
-            response.headers["Access-Control-Allow-Origin"] = "*"
-            response.headers["Access-Control-Allow-Methods"] = (
-                "GET, HEAD, OPTIONS, POST, PUT, DELETE"
-            )
-            response.headers["Access-Control-Allow-Headers"] = "Range, Content-Type"
+            """Allow public feed playback while keeping management same-origin."""
+            if not request.path.startswith("/api/"):
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+                response.headers["Access-Control-Allow-Headers"] = "Range"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "SAMEORIGIN"
             return response
 
-    def _run_single_channel_refresh(self, channel_name: str):
-        """Run refresh for a single channel in a separate thread."""
-        ui_handler = None
-        downloader_logger = None
+    def _begin_refresh(self) -> bool:
+        """Reserve refresh state before a worker starts."""
+        with self._state_lock:
+            if self.refresh_status["running"] or not self._media_lock.acquire(
+                blocking=False
+            ):
+                return False
+            self.refresh_status.update(running=True, start_time=time.time(), duration=0)
+            self._clear_logs()
+            return True
 
+    def _finish_refresh(self) -> None:
+        """Release the refresh reservation even after a worker fails."""
+        with self._state_lock:
+            start = self.refresh_status["start_time"]
+            self.refresh_status.update(
+                running=False, duration=time.time() - start if start else 0
+            )
+            self._media_lock.release()
+
+    def _scheduled_channel_refresh(self, channel_name: str) -> None:
+        """Use the same admission control for scheduled and manual refreshes."""
+        if self._begin_refresh():
+            self._run_single_channel_refresh(channel_name)
+
+    def _run_refresh(self, channel_name: str | None = None) -> None:
+        """Refresh selected channels using the configured storage paths."""
+        handler = UILogHandler(self)
+        downloader = None
         try:
-            # Get the project root directory
-            project_root = Path(__file__).parent.parent
-
-            self.logger.info(f"Starting single channel refresh for: {channel_name}")
-            self._clear_logs()  # Clear previous logs
-            self._add_log_message(f"✅ Refresh started for {channel_name}")
-
-            self.refresh_status["running"] = True
-            self.refresh_status["start_time"] = time.time()
-
-            # Import and use downloader directly
             try:
                 from .downloader import YouTubeDownloader
             except ImportError:
                 from downloader import YouTubeDownloader
-
-            # Set up custom log handler to capture downloader logs
-            ui_handler = UILogHandler(self)
-            ui_handler.setFormatter(logging.Formatter("%(message)s"))
-
-            # Get the downloader logger and add our handler
-            downloader_logger = logging.getLogger("downloader")
-            downloader_logger.addHandler(ui_handler)
-
-            # Load config
             config = self._load_channel_config()
             channels = config.get("channels", [])
-            global_config = {k: v for k, v in config.items() if k != "channels"}
-
-            # Find the specific channel
-            target_channel = None
+            if channel_name is not None:
+                channels = [
+                    channel for channel in channels if channel["name"] == channel_name
+                ]
+            global_config = {
+                key: value for key, value in config.items() if key != "channels"
+            }
+            downloader = YouTubeDownloader(
+                str(self.config_dir / "channels.yaml"), videos_dir=str(self.videos_dir)
+            )
+            downloader.logger.addHandler(handler)
             for channel in channels:
-                if channel["name"] == channel_name:
-                    target_channel = channel
-                    break
-
-            if not target_channel:
-                self.logger.error(f"Channel not found: {channel_name}")
-                self._add_log_message(f"❌ Channel not found: {channel_name}")
-                self.refresh_status["running"] = False
-                return
-
-            # Initialize downloader and process single channel
-            config_path = self.config_dir / "channels.yaml"
-            downloader = YouTubeDownloader(str(config_path), str(project_root))
-
-            # Add handler to the downloader's actual logger instance
-            if hasattr(downloader, "logger"):
-                actual_logger = downloader.logger
-                actual_logger.addHandler(ui_handler)
-                self.logger.info(
-                    f"Added UI handler to downloader logger: {actual_logger.name}"
-                )
-
-            self.logger.info(f"Processing channel: {channel_name}")
-            downloaded_count = downloader.process_channel(target_channel, global_config)
-
-            # Cleanup old episodes if max_episodes limit is exceeded
-            if downloaded_count >= 0:  # Only cleanup on successful download
-                self.logger.info(
-                    f"Cleaning up old episodes for channel: {channel_name}"
-                )
-                self._cleanup_old_episodes(channel_name, target_channel["max_episodes"])
-
-            self.refresh_status["running"] = False
-            self.refresh_status["duration"] = (
-                time.time() - self.refresh_status["start_time"]
-            )
-
-            if downloaded_count >= 0:  # Success (0 or more downloads)
-                self.logger.info(
-                    f"Single channel refresh completed successfully for {channel_name}"
-                )
-                self._add_log_message(f"✅ Refresh completed for {channel_name}")
-            else:
-                self.logger.error(f"Single channel refresh failed for {channel_name}")
-                self._add_log_message(f"❌ Refresh failed for {channel_name}")
-
-        except Exception as e:
-            self.logger.error(
-                f"Error running single channel refresh for {channel_name}: {e}"
-            )
-            self._add_log_message(
-                f"❌ Error during refresh for {channel_name}: {str(e)}"
-            )
-
-            self.refresh_status["running"] = False
-            if self.refresh_status["start_time"]:
-                self.refresh_status["duration"] = (
-                    time.time() - self.refresh_status["start_time"]
-                )
-        finally:
-            # Always remove the custom log handler
-            if ui_handler:
                 try:
-                    # Remove from both the generic downloader logger and actual downloader instance
-                    if downloader_logger:
-                        downloader_logger.removeHandler(ui_handler)
-                    # Also try to remove from the actual downloader's logger if it exists
-                    try:
-                        if "downloader" in locals() and hasattr(downloader, "logger"):
-                            downloader.logger.removeHandler(ui_handler)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+                    self._add_log_message(f"Refresh started for {channel['name']}")
+                    downloaded = downloader.process_channel(channel, global_config)
+                    if downloaded >= 0:
+                        self._cleanup_old_episodes(
+                            channel["name"], channel["max_episodes"]
+                        )
+                        self._add_log_message(
+                            f"Refresh completed for {channel['name']}"
+                        )
+                except Exception as error:
+                    self.logger.error(f"Refresh failed for {channel['name']}: {error}")
+                    self._add_log_message(
+                        f"Refresh failed for {channel['name']}: {error}"
+                    )
+        except Exception as error:
+            self.logger.error(f"Refresh failed: {error}")
+            self._add_log_message(f"Refresh failed: {error}")
+        finally:
+            if downloader is not None:
+                downloader.logger.removeHandler(handler)
+            self._finish_refresh()
+
+    def _run_single_channel_refresh(self, channel_name: str):
+        """Run a reserved refresh for one channel."""
+        self._run_refresh(channel_name)
 
     def _cleanup_old_episodes(self, channel_name: str, max_episodes: int):
-        """Remove oldest episodes exceeding the limit for a single channel."""
+        """Remove completed episodes exceeding the configured limit."""
         try:
-            channel_dir = self.videos_dir / channel_name
-            if not channel_dir.exists():
-                self.logger.info(
-                    f"No channel directory found for {channel_name}, skipping cleanup"
-                )
-                return
-
-            # Get all episode files with their metadata
-            episode_files = []
-            for json_file in channel_dir.glob("*.json"):
-                try:
-                    with open(json_file, "r") as f:
-                        metadata = json.load(f)
-                    video_id = metadata["id"]
-                    upload_date = metadata.get("upload_date", "19700101")
-                    episode_files.append((upload_date, video_id, json_file))
-                except Exception as e:
-                    self.logger.warning(f"Error reading metadata from {json_file}: {e}")
-                    continue
-
-            self.logger.info(
-                f"Found {len(episode_files)} episodes in channel directory for {channel_name}"
-            )
-            self.logger.info(f"Max episodes allowed: {max_episodes}")
-
-            # Sort by upload date (oldest first)
-            episode_files.sort(key=lambda x: x[0])
-
-            # Remove excess episodes
-            if len(episode_files) > max_episodes:
-                episodes_to_remove = episode_files[:-max_episodes]
-                self.logger.info(
-                    f"Need to remove {len(episodes_to_remove)} old episodes from {channel_name}"
-                )
-
-                for upload_date, video_id, json_file in episodes_to_remove:
-                    try:
-                        # Remove video and audio files
-                        removed_files = []
-
-                        # Check for various video formats
-                        for ext in [".mp4", ".webm", ".mkv", ".avi"]:
-                            video_file = channel_dir / f"{video_id}{ext}"
-                            if video_file.exists():
-                                video_file.unlink()
-                                removed_files.append("video")
-                                self.logger.info(f"Removed old video: {video_file}")
-                                break
-
-                        # Check for various audio formats
-                        for ext in [".m4a", ".mp3"]:
-                            audio_file = channel_dir / f"{video_id}{ext}"
-                            if audio_file.exists():
-                                audio_file.unlink()
-                                removed_files.append("audio")
-                                self.logger.info(f"Removed old audio: {audio_file}")
-                                break
-
-                        # Remove JSON metadata
-                        if json_file.exists():
-                            json_file.unlink()
-                            removed_files.append("metadata")
-                            self.logger.info(f"Removed metadata: {json_file}")
-
-                        # Remove thumbnail
-                        thumbnails_dir = channel_dir / "thumbnails"
-                        if thumbnails_dir.exists():
-                            thumbnail_removed = False
-                            for thumb_file in thumbnails_dir.glob(f"{video_id}.*"):
-                                thumb_file.unlink()
-                                thumbnail_removed = True
-                                self.logger.info(f"Removed thumbnail: {thumb_file}")
-                            if thumbnail_removed:
-                                removed_files.append("thumbnail")
-
-                        self.logger.info(
-                            f"Removed episode {video_id}: {', '.join(removed_files)}"
-                        )
-
-                    except Exception as e:
-                        self.logger.error(f"Error removing episode {video_id}: {e}")
-            else:
-                self.logger.info(
-                    f"No cleanup needed for {channel_name} (within episode limit)"
-                )
-
-        except Exception as e:
-            self.logger.error(f"Error during cleanup for channel {channel_name}: {e}")
+            cleanup_episodes(self.videos_dir, channel_name, max_episodes)
+        except Exception as error:
+            self.logger.error(f"Error cleaning up {channel_name}: {error}")
 
     def _run_automation_script(self):
-        """Run the automation script in a separate thread."""
-        process = None
-        try:
-            # Get the project root directory
-            project_root = Path(__file__).parent.parent
-            cron_runner_script = project_root / "src" / "cron_runner.py"
-
-            self.logger.info("Starting cron runner refresh")
-            self.refresh_status["running"] = True
-            self.refresh_status["start_time"] = time.time()
-
-            # Run the cron runner with live output streaming
-            process = subprocess.Popen(
-                ["python", str(cron_runner_script)],
-                cwd=str(project_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
-
-            # Stream output line by line
-            if process.stdout:
-                for line in iter(process.stdout.readline, ""):
-                    if line:
-                        # Remove trailing newline and log through webserver logger
-                        clean_line = line.rstrip()
-                        self.logger.info(f"[CRON] {clean_line}")
-                        # Store log for UI display
-                        self._add_log_message(clean_line)
-
-            # Wait for process to complete
-            return_code = process.wait(timeout=3600)  # 1 hour timeout
-
-            self.refresh_status["running"] = False
-            self.refresh_status["duration"] = (
-                time.time() - self.refresh_status["start_time"]
-            )
-
-            if return_code == 0:
-                self.logger.info("Cron runner completed successfully")
-            else:
-                self.logger.error(f"Cron runner failed with return code {return_code}")
-
-        except subprocess.TimeoutExpired:
-            self.logger.error("Cron runner timed out")
-            if process:
-                process.kill()
-            self.refresh_status["running"] = False
-            self.refresh_status["duration"] = (
-                time.time() - self.refresh_status["start_time"]
-            )
-        except Exception as e:
-            self.logger.error(f"Error running cron runner: {e}")
-            self.refresh_status["running"] = False
-            self.refresh_status["duration"] = (
-                time.time() - self.refresh_status["start_time"]
-            )
+        """Run a reserved refresh for all channels."""
+        self._run_refresh()
 
     def _handle_refresh_trigger(self):
         """Handle refresh trigger request."""
+        reserved = False
         try:
-            if self.refresh_status["running"]:
+            if not self._begin_refresh():
                 return jsonify({"error": "Refresh already in progress"}), 409
 
-            # Start the automation script in a background thread
+            reserved = True
+            # Start the refresh in a background thread
             thread = threading.Thread(target=self._run_automation_script)
             thread.daemon = True
             thread.start()
@@ -687,6 +642,8 @@ class YouTubePodcastServer:
             return jsonify({"message": "Refresh started successfully"}), 200
 
         except Exception as e:
+            if reserved:
+                self._finish_refresh()
             self.logger.error(f"Error triggering refresh: {e}")
             return jsonify({"error": "Failed to start refresh"}), 500
 
@@ -761,7 +718,7 @@ class YouTubePodcastServer:
                 ), 400
 
             # Restart scheduler with new default interval
-            if not self._restart_scheduler(int(new_interval)):
+            if not self._restart_scheduler(new_interval):
                 return jsonify({"error": "Failed to restart scheduler"}), 500
 
             # Get updated schedule info
@@ -786,9 +743,9 @@ class YouTubePodcastServer:
     def _validate_display_name(
         self,
         display_name: str,
-        existing_ids: Optional[List[str]] = None,
-        existing_display_names: Optional[List[str]] = None,
-    ) -> Tuple[bool, str, str]:
+        existing_ids: list[str] | None = None,
+        existing_display_names: list[str] | None = None,
+    ) -> tuple[bool, str, str]:
         """Validate display name and generate sanitized ID.
 
         Returns:
@@ -831,7 +788,7 @@ class YouTubePodcastServer:
 
         return True, "", sanitized_id
 
-    def _verify_youtube_channel(self, url: str) -> Tuple[bool, str, dict]:
+    def _verify_youtube_channel(self, url: str) -> tuple[bool, str, dict]:
         """Verify if YouTube channel URL is accessible and valid.
 
         Returns:
@@ -841,7 +798,9 @@ class YouTubePodcastServer:
             return False, "YouTube URL cannot be empty", {}
 
         # Basic URL format validation
-        if not url.startswith(("https://www.youtube.com/", "https://youtube.com/")):
+        if not isinstance(url, str) or not url.startswith(
+            ("https://www.youtube.com/", "https://youtube.com/")
+        ):
             return False, "URL must be a valid YouTube channel URL", {}
 
         # Normalize URL to use www
@@ -870,7 +829,7 @@ class YouTubePodcastServer:
                 **self._get_proxy_opts(),
             }
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(cast(Any, ydl_opts)) as ydl:
                 info = ydl.extract_info(url, download=False)
 
                 if not info:
@@ -887,18 +846,19 @@ class YouTubePodcastServer:
 
                 return True, "", channel_info
 
-        except yt_dlp.DownloadError as e:
+        except DownloadError as e:
             error_msg = str(e).lower()
             if "private" in error_msg or "unavailable" in error_msg:
                 return False, "Channel is private or unavailable", {}
             elif "not found" in error_msg or "does not exist" in error_msg:
                 return False, "Channel does not exist", {}
             else:
-                return False, f"Failed to access channel: {str(e)}", {}
+                return False, f"Failed to access channel: {e!s}", {}
         except Exception as e:
             self.logger.error(f"Error verifying YouTube channel {url}: {e}")
             return False, "Unable to verify channel accessibility", {}
 
+    @config_transaction
     def _handle_add_channel(self):
         """Handle adding a new channel."""
         try:
@@ -942,11 +902,13 @@ class YouTubePodcastServer:
                 "download_delay_hours": data.get("download_delay_hours", 6),
                 "format": data.get("format", "video"),
                 "quality": data.get("quality", "max"),
+                **(
+                    {"refresh_interval_hours": data["refresh_interval_hours"]}
+                    if "refresh_interval_hours" in data
+                    else {}
+                ),
                 "sponsorblock_categories": data.get("sponsorblock_categories", []),
             }
-
-            # Reload config to ensure we have the latest state before modifying
-            config = self._load_channel_config()
 
             # Add to config
             if "channels" not in config:
@@ -971,6 +933,7 @@ class YouTubePodcastServer:
             self.logger.error(f"Error adding channel: {e}")
             return jsonify({"error": "Internal server error"}), 500
 
+    @config_transaction
     def _handle_update_channel(self, channel_name: str):
         """Handle updating an existing channel."""
         try:
@@ -1035,52 +998,8 @@ class YouTubePodcastServer:
             if "sponsorblock_categories" in data:
                 channel["sponsorblock_categories"] = data["sponsorblock_categories"]
 
-            # Reload config to ensure we have the latest state before saving
-            config = self._load_channel_config()
-
-            # Find and update the channel again in the reloaded config
-            channel_index = None
-            for i, ch in enumerate(config.get("channels", [])):
-                if ch["name"] == channel_name:
-                    channel_index = i
-                    break
-
-            if channel_index is None:
-                return jsonify({"error": "Channel not found after reload"}), 404
-
-            # Apply all the updates to the reloaded channel
-            channel = config["channels"][channel_index]
-            if "display_name" in data:
-                # Re-validate display name against current channels
-                existing_ids = [
-                    ch["name"]
-                    for i, ch in enumerate(config["channels"])
-                    if i != channel_index
-                ]
-                existing_display_names = [
-                    ch.get("display_name", ch["name"])
-                    for i, ch in enumerate(config["channels"])
-                    if i != channel_index
-                ]
-
-                name_valid, name_error, _ = self._validate_display_name(
-                    data["display_name"], existing_ids, existing_display_names
-                )
-                if not name_valid:
-                    return jsonify({"error": name_error}), 400
-                channel["display_name"] = data["display_name"]
-            if "url" in data:
-                channel["url"] = data["url"]
-            if "max_episodes" in data:
-                channel["max_episodes"] = data["max_episodes"]
-            if "download_delay_hours" in data:
-                channel["download_delay_hours"] = data["download_delay_hours"]
-            if "format" in data:
-                channel["format"] = data["format"]
-            if "quality" in data:
-                channel["quality"] = data["quality"]
-            if "sponsorblock_categories" in data:
-                channel["sponsorblock_categories"] = data["sponsorblock_categories"]
+            if "refresh_interval_hours" in data:
+                channel["refresh_interval_hours"] = data["refresh_interval_hours"]
 
             # Save config
             if self._save_channel_config(config):
@@ -1101,14 +1020,11 @@ class YouTubePodcastServer:
             self.logger.error(f"Error updating channel: {e}")
             return jsonify({"error": "Internal server error"}), 500
 
+    @config_transaction
     def _handle_delete_channel(self, channel_name: str):
         """Handle deleting a channel."""
         try:
             # Load current config
-            config = self._load_channel_config()
-            channels = config.get("channels", [])
-
-            # Reload config to ensure we have the latest state before modifying
             config = self._load_channel_config()
             channels = config.get("channels", [])
 
@@ -1132,6 +1048,7 @@ class YouTubePodcastServer:
             self.logger.error(f"Error deleting channel: {e}")
             return jsonify({"error": "Internal server error"}), 500
 
+    @exclusive_media_operation
     def _handle_purge_episodes(self, channel_name: str):
         """Handle purging episodes for a channel."""
         try:
@@ -1173,8 +1090,9 @@ class YouTubePodcastServer:
                     if channel_name in timestamps:
                         del timestamps[channel_name]
 
-                        with open(timestamps_file, "w", encoding="utf-8") as f:
-                            json.dump(timestamps, f, indent=2)
+                        atomic_write_text(
+                            timestamps_file, json.dumps(timestamps, indent=2)
+                        )
 
                         self.logger.info(
                             f"Cleared refresh timestamp for channel: {channel_name}"
@@ -1290,6 +1208,7 @@ class YouTubePodcastServer:
 
     def _handle_single_channel_refresh(self, channel_name: str):
         """Handle single channel refresh request."""
+        reserved = False
         try:
             if self.refresh_status["running"]:
                 return jsonify({"error": "Refresh already in progress"}), 409
@@ -1302,6 +1221,10 @@ class YouTubePodcastServer:
             if not channel_exists:
                 return jsonify({"error": "Channel not found"}), 404
 
+            if not self._begin_refresh():
+                return jsonify({"error": "Refresh already in progress"}), 409
+
+            reserved = True
             # Start the single channel refresh in a background thread
             thread = threading.Thread(
                 target=self._run_single_channel_refresh, args=(channel_name,)
@@ -1314,6 +1237,8 @@ class YouTubePodcastServer:
             ), 200
 
         except Exception as e:
+            if reserved:
+                self._finish_refresh()
             self.logger.error(f"Error triggering single channel refresh: {e}")
             return jsonify({"error": "Failed to start channel refresh"}), 500
 
@@ -1366,11 +1291,9 @@ class YouTubePodcastServer:
         """Handle MP3 conversion and download for an episode."""
         import tempfile
 
+        temp_mp3_path = None
+        response_owns_temp_file = False
         try:
-            # Sanitize inputs
-            channel_name = secure_filename(channel_name)
-            episode_id = secure_filename(episode_id)
-
             # Validate channel exists
             config = self._load_channel_config()
             channels = config.get("channels", [])
@@ -1482,18 +1405,14 @@ class YouTubePodcastServer:
                         ),
                     )
 
-                    # Clean up temp file after sending
-                    def cleanup_temp_file():
-                        try:
-                            Path(temp_mp3_path).unlink(missing_ok=True)
-                        except Exception as e:
-                            self.logger.warning(
-                                f"Failed to cleanup temp file {temp_mp3_path}: {e}"
-                            )
-
-                    # Schedule cleanup after response is sent
-                    response.call_on_close(cleanup_temp_file)
-
+                    # send_file uses direct passthrough, so close the file wrapper
+                    # before unlinking, including when the client disconnects.
+                    converted_path = Path(temp_mp3_path)
+                    response.direct_passthrough = False
+                    response.call_on_close(
+                        lambda: converted_path.unlink(missing_ok=True)
+                    )
+                    response_owns_temp_file = True
                     return response
 
                 except Exception as e:
@@ -1519,14 +1438,13 @@ class YouTubePodcastServer:
                 f"Error in MP3 download for {channel_name}/{episode_id}: {e}"
             )
             return jsonify({"error": "Internal server error"}), 500
+        finally:
+            if temp_mp3_path is not None and not response_owns_temp_file:
+                Path(temp_mp3_path).unlink(missing_ok=True)
 
     def _handle_original_download(self, channel_name: str, episode_id: str):
         """Handle download of original episode file with clean filename."""
         try:
-            # Sanitize inputs
-            channel_name = secure_filename(channel_name)
-            episode_id = secure_filename(episode_id)
-
             # Validate channel exists
             config = self._load_channel_config()
             channels = config.get("channels", [])
@@ -1587,6 +1505,7 @@ class YouTubePodcastServer:
             )
             return jsonify({"error": "Internal server error"}), 500
 
+    @exclusive_media_operation
     def _handle_delete_episode(self, channel_name: str, episode_id: str):
         """Handle deletion of a single episode."""
         try:
@@ -1633,15 +1552,18 @@ class YouTubePodcastServer:
             return jsonify(
                 {
                     "success": True,
-                    "message": f"Episode deleted successfully",
+                    "message": "Episode deleted successfully",
                     "removed": removed_files,
                 }
             ), 200
 
         except Exception as e:
-            self.logger.error(f"Error deleting episode {channel_name}/{episode_id}: {e}")
+            self.logger.error(
+                f"Error deleting episode {channel_name}/{episode_id}: {e}"
+            )
             return jsonify({"error": "Internal server error"}), 500
 
+    @exclusive_media_operation
     def _handle_redownload_episode(self, channel_name: str, episode_id: str):
         """Handle redownloading a single episode."""
         try:
@@ -1675,37 +1597,13 @@ class YouTubePodcastServer:
             video_url = f"https://www.youtube.com/watch?v={episode_id}"
             video_title = metadata.get("title", "Unknown")
 
-            # Delete old files
-            for ext in [".mp4", ".m4a", ".mp3", ".webm", ".mkv", ".avi"]:
-                video_file = channel_dir / f"{episode_id}{ext}"
-                if video_file.exists():
-                    video_file.unlink()
+            import tempfile
 
-            if json_file.exists():
-                json_file.unlink()
-
-            thumbnails_dir = channel_dir / "thumbnails"
-            if thumbnails_dir.exists():
-                for thumb_file in thumbnails_dir.glob(f"{episode_id}.*"):
-                    thumb_file.unlink()
-
-            # Redownload the episode
             try:
                 from .downloader import YouTubeDownloader
             except ImportError:
                 from downloader import YouTubeDownloader
 
-            # Initialize downloader with proper paths
-            project_root = Path(__file__).parent.parent
-            config_path = self.config_dir / "channels.yaml"
-            downloader = YouTubeDownloader(str(config_path), str(project_root))
-
-            # Get download settings from channel config
-            format_type = channel_config.get("format", "video")
-            quality = channel_config.get("quality", "max")
-            sponsorblock_categories = channel_config.get("sponsorblock_categories")
-
-            # Prepare video info
             video_info = {
                 "id": episode_id,
                 "title": video_title,
@@ -1713,18 +1611,49 @@ class YouTubePodcastServer:
                 "upload_date": metadata.get("upload_date", ""),
                 "duration": metadata.get("duration", 0),
             }
-
-            # Download the video
-            success = downloader.download_video(
-                video_info,
-                channel_name,
-                sponsorblock_categories=sponsorblock_categories,
-                format_type=format_type,
-                quality=quality,
-            )
-
-            if not success:
-                return jsonify({"error": "Failed to redownload episode"}), 500
+            with tempfile.TemporaryDirectory(
+                dir=self.videos_dir, prefix=".redownload-"
+            ) as staging:
+                downloader = YouTubeDownloader(
+                    str(self.config_dir / "channels.yaml"), videos_dir=staging
+                )
+                success = downloader.download_video(
+                    video_info,
+                    channel_name,
+                    sponsorblock_categories=channel_config.get(
+                        "sponsorblock_categories"
+                    ),
+                    format_type=channel_config.get("format", "video"),
+                    quality=channel_config.get("quality", "max"),
+                )
+                staged_channel = Path(staging) / channel_name
+                staged_metadata = staged_channel / f"{episode_id}.json"
+                staged_media = [
+                    staged_channel / f"{episode_id}{ext}" for ext in MEDIA_EXTENSIONS
+                ]
+                staged_media = [
+                    path
+                    for path in staged_media
+                    if path.is_file() and path.stat().st_size > 0
+                ]
+                if not success or not staged_metadata.is_file() or not staged_media:
+                    return jsonify(
+                        {"error": "Failed to redownload episode; original preserved"}
+                    ), 500
+                thumbnails = channel_dir / "thumbnails"
+                thumbnails.mkdir(exist_ok=True)
+                for thumbnail in (staged_channel / "thumbnails").glob(
+                    f"{episode_id}.*"
+                ):
+                    thumbnail.replace(thumbnails / thumbnail.name)
+                for media in staged_media:
+                    media.replace(channel_dir / media.name)
+                staged_metadata.replace(json_file)
+                new_names = {path.name for path in staged_media}
+                for ext in MEDIA_EXTENSIONS:
+                    old_media = channel_dir / f"{episode_id}{ext}"
+                    if old_media.name not in new_names:
+                        old_media.unlink(missing_ok=True)
 
             # RSS feed will automatically reflect changes on next request (dynamic generation)
             self.logger.info(f"Successfully redownloaded episode {episode_id}")
@@ -1794,7 +1723,6 @@ class YouTubePodcastServer:
 
     def _serve_rss_feed(self, channel_name: str) -> Response:
         """Dynamically generate and serve RSS feed."""
-        channel_name = secure_filename(channel_name)
 
         # Load channel config to get display name
         config = self._load_channel_config()
@@ -1833,11 +1761,9 @@ class YouTubePodcastServer:
 
     def _serve_video_file(self, channel_name: str, filename: str) -> Response:
         """Serve episode file (video/audio) with range request support."""
-        channel_name = secure_filename(channel_name)
-        filename = secure_filename(filename)
         episode_file = self.videos_dir / channel_name / filename
 
-        if not episode_file.exists():
+        if not episode_file.is_file():
             self.logger.warning(f"Episode file not found: {episode_file}")
             abort(404)
 
@@ -1853,75 +1779,20 @@ class YouTubePodcastServer:
         }
         mime_type = mime_type_map.get(file_ext, "video/mp4")
 
-        # Get file size
-        file_size = episode_file.stat().st_size
-
-        # Handle range requests for streaming
-        range_header = request.headers.get("Range")
-        if range_header:
-            return self._serve_partial_content(
-                episode_file, file_size, range_header, mime_type
-            )
-        else:
-            # Serve full file
-            try:
-                return send_file(
-                    str(episode_file), mimetype=mime_type, as_attachment=False
-                )
-            except Exception as e:
-                self.logger.error(f"Error serving episode file {episode_file}: {e}")
-                abort(500)
-
-    def _serve_partial_content(
-        self,
-        file_path: Path,
-        file_size: int,
-        range_header: str,
-        mime_type: str = "video/mp4",
-    ) -> Response:
-        """Serve partial content for range requests."""
-        try:
-            # Parse range header (e.g., "bytes=0-1023")
-            range_match = range_header.replace("bytes=", "")
-            range_start, range_end = range_match.split("-")
-
-            start = int(range_start) if range_start else 0
-            end = int(range_end) if range_end else file_size - 1
-
-            # Ensure valid range
-            start = max(0, start)
-            end = min(file_size - 1, end)
-            content_length = end - start + 1
-
-            # Read file chunk
-            with open(file_path, "rb") as f:
-                f.seek(start)
-                data = f.read(content_length)
-
-            response = Response(
-                data,
-                206,  # Partial Content
-                headers={
-                    "Content-Range": f"bytes {start}-{end}/{file_size}",
-                    "Accept-Ranges": "bytes",
-                    "Content-Length": str(content_length),
-                    "Content-Type": mime_type,
-                },
-            )
-
-            return response
-
-        except Exception as e:
-            self.logger.error(f"Error serving partial content: {e}")
-            abort(500)
+        if file_ext not in MEDIA_EXTENSIONS:
+            abort(404)
+        return send_file(str(episode_file), mimetype=mime_type, conditional=True)
 
     def _serve_thumbnail_file(self, channel_name: str, filename: str) -> Response:
         """Serve thumbnail image."""
-        channel_name = secure_filename(channel_name)
-        filename = secure_filename(filename)
         thumbnail_file = self.videos_dir / channel_name / "thumbnails" / filename
 
-        if not thumbnail_file.exists():
+        if not thumbnail_file.is_file() or thumbnail_file.suffix.lower() not in (
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp",
+        ):
             self.logger.warning(f"Thumbnail file not found: {thumbnail_file}")
             abort(404)
 

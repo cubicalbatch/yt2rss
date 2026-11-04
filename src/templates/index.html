@@ -53,7 +53,7 @@
                         Never
                     </div>
                     {% endif %}
-                    <button class="refresh-channel-btn-card" onclick="refreshSingleChannel('{{ podcast.original_name }}', this)">
+                    <button class="refresh-channel-btn-card" onclick='refreshSingleChannel({{ podcast.original_name | tojson }}, this)'>
                         🔄
                     </button>
                 </div>
@@ -62,13 +62,13 @@
                 <a href="{{ podcast.url }}" target="_blank" class="podcast-url">{{ podcast.url | format_youtube_url }}</a>
                 
                 <div class="channel-actions">
-                    <button class="edit-btn" onclick="openEditChannelModal('{{ podcast.original_name }}')">
+                    <button class="edit-btn" onclick='openEditChannelModal({{ podcast.original_name | tojson }})'>
                         ✏️ Edit
                     </button>
                 </div>
                 
                 <div class="podcast-stats">
-                    <div class="stat episode-count-stat" onclick="openEpisodesModal('{{ podcast.original_name }}', '{{ podcast.name }}')">
+                    <div class="stat episode-count-stat" onclick='openEpisodesModal({{ podcast.original_name | tojson }}, {{ podcast.name | tojson }})'>
                         <span class="stat-value">{{ podcast.episode_count }}</span>
                         <span class="stat-label">Episodes</span>
                     </div>
@@ -97,10 +97,10 @@
                 </div>
                 
                 <div class="feed-button-group">
-                    <button class="copy-button" onclick="copyFeedUrl('{{ podcast.feed_url }}', this)">
+                    <button class="copy-button" onclick='copyFeedUrl({{ podcast.feed_url | tojson }}, this)'>
                         📋 Copy Feed URL
                     </button>
-                    <button class="open-button" onclick="openFeedUrl('{{ podcast.feed_url }}')" title="Open feed in new tab">
+                    <button class="open-button" onclick='openFeedUrl({{ podcast.feed_url | tojson }})' title="Open feed in new tab">
                         ↗️ Open
                     </button>
                 </div>

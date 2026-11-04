@@ -2,12 +2,13 @@
 Shared pytest configuration and fixtures.
 """
 
-import pytest
-import tempfile
 import shutil
+import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
-import sys
+
+import pytest
 
 # Add the project root to the Python path to ensure imports work
 project_root = Path(__file__).parent.parent
