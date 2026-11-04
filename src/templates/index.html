@@ -25,6 +25,14 @@
                 <button class="settings-btn" onclick="openScheduleModal()">
                     ⚙️ Scheduler Settings
                 </button>
+                {% if auth_enabled %}
+                <form method="post" action="{{ url_for('logout') }}" class="logout-form">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button type="submit" class="logout-btn" title="Log out">
+                        🚪 Log Out
+                    </button>
+                </form>
+                {% endif %}
             </div>
         </div>
         
@@ -104,6 +112,16 @@
                         ↗️ Open
                     </button>
                 </div>
+                {% if auth_enabled %}
+                <div class="feed-privacy">
+                    <span class="feed-privacy-note">
+                        🔒 Private feed: the copied URL includes its access token — plain feed URLs require login.
+                    </span>
+                    <button class="rotate-token-btn" onclick='rotateFeedToken({{ podcast.original_name | tojson }}, this)' title="Generate a new access token; existing tokenized feed URLs stop working">
+                        🔑 Rotate Token
+                    </button>
+                </div>
+                {% endif %}
             </div>
             {% endfor %}
         </div>

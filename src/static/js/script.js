@@ -7,6 +7,35 @@ function openFeedUrl(url) {
     window.open(url, '_blank');
 }
 
+// Rotate a channel's private feed token, then reload to show fresh URLs
+async function rotateFeedToken(channelName, button) {
+    if (!confirm('Rotate the feed token for this channel?\n\nExisting tokenized feed URLs for it will stop working.')) {
+        return;
+    }
+    const originalText = button.textContent;
+    try {
+        button.textContent = '⏳ Rotating...';
+        button.disabled = true;
+        const response = await fetch(`/api/channels/${encodeURIComponent(channelName)}/rotate-token`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            }
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || 'Token rotation failed');
+        }
+        showToast('✅ Feed token rotated');
+        window.location.reload();
+    } catch (error) {
+        console.error('Error rotating feed token:', error);
+        showToast('❌ ' + (error.message || 'Token rotation failed'));
+        button.textContent = originalText;
+        button.disabled = false;
+    }
+}
+
 // Copy feed URL functionality
 async function copyFeedUrl(url, button) {
     try {

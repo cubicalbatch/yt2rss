@@ -8,21 +8,41 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import yaml
 import yt_dlp
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from flask import Flask, Response, abort, jsonify, render_template, request, send_file
+from flask import (
+    Flask,
+    Response,
+    abort,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    session,
+    url_for,
+)
+from werkzeug.wrappers import Response as WerkzeugResponse
 from yt_dlp.utils import DownloadError
 
 try:
+    from .auth import (
+        LoginThrottler,
+        constant_time_equals,
+        generate_csrf_token,
+        generate_feed_token,
+        is_safe_relative_path,
+        load_or_create_session_secret,
+    )
     from .rss_generator import RSSGenerator
     from .utils import (
         MEDIA_EXTENSIONS,
@@ -38,6 +58,14 @@ try:
         validate_channel_settings,
     )
 except ImportError:
+    from auth import (
+        LoginThrottler,
+        constant_time_equals,
+        generate_csrf_token,
+        generate_feed_token,
+        is_safe_relative_path,
+        load_or_create_session_secret,
+    )
     from rss_generator import RSSGenerator
     from utils import (
         MEDIA_EXTENSIONS,
@@ -141,6 +169,7 @@ class YouTubePodcastServer:
         # Initialize Flask app with templates and static folders
         self.app = Flask(__name__, template_folder="templates", static_folder="static")
         self.app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
+        self._setup_auth()
         self._setup_custom_filters()
         self._setup_routes()
 
@@ -151,6 +180,166 @@ class YouTubePodcastServer:
         """Stop the scheduler once, including during interpreter shutdown."""
         if self.scheduler.running:
             self.scheduler.shutdown()
+
+    def _setup_auth(self) -> None:
+        """Configure optional password authentication from the environment.
+
+        Authentication is enabled only when ``YT2RSS_PASSWORD`` is set. The
+        Flask session cookie is signed with ``YT2RSS_SECRET_KEY`` when provided,
+        otherwise a key is generated once and persisted in the config directory.
+        """
+        self.auth_enabled = bool(os.getenv("YT2RSS_PASSWORD"))
+        self.auth_username = os.getenv("YT2RSS_USERNAME", "admin")
+        self.auth_password = os.getenv("YT2RSS_PASSWORD")
+        self._login_throttler = LoginThrottler()
+
+        base_url = os.getenv("BASE_URL", "")
+        self.app.config.update(
+            PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+            SESSION_COOKIE_HTTPONLY=True,
+            SESSION_COOKIE_SAMESITE="Lax",
+            SESSION_COOKIE_SECURE=base_url.startswith("https://"),
+        )
+
+        if not self.auth_enabled:
+            return
+
+        secret_key = os.getenv("YT2RSS_SECRET_KEY")
+        if secret_key:
+            self.app.secret_key = secret_key
+        else:
+            ensure_directory(str(self.config_dir))
+            self.app.secret_key = load_or_create_session_secret(self.config_dir)
+        self.logger.info("🔒 Password authentication enabled")
+
+    def _has_authenticated_session(self) -> bool:
+        """Check the request carries a logged-in session."""
+        return bool(session.get("authenticated"))
+
+    def _redirect_to_login(self) -> WerkzeugResponse:
+        """Redirect an anonymous page request to the login form."""
+        target = request.full_path if request.query_string else request.path
+        return redirect(url_for("login", next=target))
+
+    def _safe_next_target(self, target: str | None) -> str:
+        """Resolve a post-login redirect target, rejecting off-site paths."""
+        if is_safe_relative_path(target):
+            return target
+        return url_for("index")
+
+    def _stored_feed_token(self, channel_name: str) -> str | None:
+        """Read a channel's feed token without generating one."""
+        config = self._load_channel_config()
+        for channel in config.get("channels", []):
+            if channel["name"] == channel_name:
+                token = channel.get("feed_token")
+                return str(token) if token else None
+        return None
+
+    def _request_feed_token_valid(self, channel_name: str) -> bool:
+        """Check the request token against the channel's stored feed token."""
+        provided = request.args.get("token", "")
+        if not provided:
+            return False
+        expected = self._stored_feed_token(channel_name)
+        return bool(expected) and constant_time_equals(provided, expected)
+
+    @config_transaction
+    def _get_or_create_feed_token(self, channel_name: str) -> str | None:
+        """Return a channel's feed token, generating and persisting it on demand.
+
+        Args:
+            channel_name: Sanitized channel identifier.
+
+        Returns:
+            The channel's stable feed token, or None when the channel is
+            unknown or the configuration could not be saved.
+        """
+        config = self._load_channel_config()
+        for channel in config.get("channels", []):
+            if channel["name"] == channel_name:
+                token = channel.get("feed_token")
+                if not token:
+                    token = generate_feed_token()
+                    channel["feed_token"] = token
+                    if not self._save_channel_config(config):
+                        return None
+                return str(token)
+        return None
+
+    @config_transaction
+    def _rotate_feed_token(self, channel_name: str) -> str | None:
+        """Replace a channel's feed token, invalidating previous URLs.
+
+        Args:
+            channel_name: Sanitized channel identifier.
+
+        Returns:
+            The new feed token, or None when the channel is unknown or the
+            configuration could not be saved.
+        """
+        config = self._load_channel_config()
+        for channel in config.get("channels", []):
+            if channel["name"] == channel_name:
+                token = generate_feed_token()
+                channel["feed_token"] = token
+                if not self._save_channel_config(config):
+                    return None
+                return token
+        return None
+
+    def _serve_login_page(self, error: str | None, next_target: str) -> str:
+        """Render the login form with an optional error message."""
+        return render_template("login.html", error=error, next=next_target or "")
+
+    def _handle_login(self) -> WerkzeugResponse | str | tuple[str, int]:
+        """Show the login page and authenticate submitted credentials."""
+        if not self.auth_enabled:
+            return redirect(url_for("index"))
+
+        next_target = request.values.get("next", "")
+        if request.method == "GET":
+            if self._has_authenticated_session():
+                return redirect(self._safe_next_target(next_target))
+            return self._serve_login_page(None, next_target)
+
+        address = request.remote_addr or "unknown"
+        if self._login_throttler.is_blocked(address):
+            self.logger.warning(f"Login throttled for {address}")
+            return self._serve_login_page(
+                "Too many failed attempts. Try again later.", next_target
+            ), 429
+
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        username_ok = constant_time_equals(username, self.auth_username)
+        password_ok = constant_time_equals(password, self.auth_password or "")
+        if not (username_ok and password_ok):
+            self._login_throttler.record_failure(address)
+            return self._serve_login_page(
+                "Invalid username or password.", next_target
+            ), 401
+
+        self._login_throttler.record_success(address)
+        session.clear()
+        session["authenticated"] = True
+        session["username"] = self.auth_username
+        session["csrf_token"] = generate_csrf_token()
+        session.permanent = True
+        return redirect(self._safe_next_target(next_target))
+
+    def _handle_logout(self) -> WerkzeugResponse:
+        """Clear the login session after validating the CSRF token."""
+        if not self.auth_enabled:
+            return redirect(url_for("index"))
+
+        token = request.form.get("csrf_token", "")
+        expected = session.get("csrf_token")
+        if not (isinstance(expected, str) and constant_time_equals(token, expected)):
+            abort(400)
+
+        session.clear()
+        return redirect(url_for("login"))
 
     def _get_proxy_opts(self) -> dict:
         """Get proxy configuration from environment variables.
@@ -366,6 +555,9 @@ class YouTubePodcastServer:
         @self.app.before_request
         def validate_request() -> tuple[Response, int] | None:
             """Reject unsafe paths and browser requests from another origin."""
+            # Flask's static handler enforces its own containment rules.
+            if request.endpoint == "static":
+                return None
             arguments = request.view_args or {}
             try:
                 for field in ("channel_name", "episode_id", "filename"):
@@ -420,6 +612,37 @@ class YouTubePodcastServer:
                         validate_channel_settings(data)
                     except (ValueError, OverflowError) as error:
                         return jsonify({"error": str(error)}), 400
+
+        @self.app.before_request
+        def authenticate_request() -> (
+            WerkzeugResponse | tuple[WerkzeugResponse | str, int] | None
+        ):
+            """Enforce optional password auth and per-channel feed tokens."""
+            if not self.auth_enabled:
+                return None
+            if request.endpoint in ("static", "login", "logout") or (
+                request.endpoint is None
+            ):
+                return None
+
+            if self._has_authenticated_session():
+                return None
+
+            channel_name = (request.view_args or {}).get("channel_name")
+            if request.endpoint == "index":
+                return self._redirect_to_login()
+            if request.endpoint == "serve_feed":
+                # Unknown channels fail the same way as bad tokens (404).
+                if not (channel_name and self._request_feed_token_valid(channel_name)):
+                    abort(404)
+                return None
+            if request.endpoint in ("serve_video", "serve_thumbnail"):
+                if not (channel_name and self._request_feed_token_valid(channel_name)):
+                    return jsonify({"error": "Authentication required"}), 401
+                return None
+
+            # Everything else (management API) requires a login session.
+            return jsonify({"error": "Authentication required"}), 401
 
         @self.app.route("/")
         def index():
@@ -528,6 +751,21 @@ class YouTubePodcastServer:
         def refresh_single_channel(channel_name: str):
             """Trigger refresh for a single channel."""
             return self._handle_single_channel_refresh(channel_name)
+
+        @self.app.route("/api/channels/<channel_name>/rotate-token", methods=["POST"])
+        def rotate_feed_token(channel_name: str):
+            """Rotate a channel's private feed token."""
+            return self._handle_rotate_feed_token(channel_name)
+
+        @self.app.route("/login", methods=["GET", "POST"])
+        def login():
+            """Show the login form and process password logins."""
+            return self._handle_login()
+
+        @self.app.route("/logout", methods=["POST"])
+        def logout():
+            """Clear the login session (CSRF-protected POST)."""
+            return self._handle_logout()
 
         @self.app.after_request
         def after_request(response):
@@ -908,6 +1146,7 @@ class YouTubePodcastServer:
                     else {}
                 ),
                 "sponsorblock_categories": data.get("sponsorblock_categories", []),
+                "feed_token": generate_feed_token(),
             }
 
             # Add to config
@@ -1046,6 +1285,22 @@ class YouTubePodcastServer:
 
         except Exception as e:
             self.logger.error(f"Error deleting channel: {e}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    def _handle_rotate_feed_token(self, channel_name: str):
+        """Rotate a channel's private feed token."""
+        try:
+            token = self._rotate_feed_token(channel_name)
+            if token is None:
+                return jsonify({"error": "Channel not found"}), 404
+            return jsonify(
+                {
+                    "message": "Feed token rotated successfully",
+                    "feed_token": token,
+                }
+            ), 200
+        except Exception as e:
+            self.logger.error(f"Error rotating feed token for {channel_name}: {e}")
             return jsonify({"error": "Internal server error"}), 500
 
     @exclusive_media_operation
@@ -1687,6 +1942,10 @@ class YouTubePodcastServer:
             # Use BASE_URL environment variable if set, otherwise use request host
             base_url = os.getenv("BASE_URL", request.host_url.rstrip("/"))
             feed_url = f"{base_url}/feeds/{channel_id}"
+            if self.auth_enabled:
+                feed_token = self._get_or_create_feed_token(channel_id)
+                if feed_token:
+                    feed_url = f"{feed_url}?token={quote(feed_token, safe='')}"
 
             # Get episode count for this channel (both video and audio files)
             channel_dir = self.videos_dir / channel_id
@@ -1719,7 +1978,12 @@ class YouTubePodcastServer:
                 }
             )
 
-        return render_template("index.html", podcasts=podcasts)
+        return render_template(
+            "index.html",
+            podcasts=podcasts,
+            auth_enabled=self.auth_enabled,
+            csrf_token=session.get("csrf_token", "") if self.auth_enabled else "",
+        )
 
     def _serve_rss_feed(self, channel_name: str) -> Response:
         """Dynamically generate and serve RSS feed."""
@@ -1739,7 +2003,10 @@ class YouTubePodcastServer:
 
         # Initialize RSS generator with base URL
         base_url = os.getenv("BASE_URL", request.host_url.rstrip("/"))
-        rss_generator = RSSGenerator(base_url)
+        feed_token = (
+            self._get_or_create_feed_token(channel_name) if self.auth_enabled else None
+        )
+        rss_generator = RSSGenerator(base_url, feed_token=feed_token)
 
         # Generate RSS feed dynamically from filesystem
         try:

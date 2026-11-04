@@ -125,6 +125,35 @@ Available categories for automatic removal:
     - `YT_DLP_PROXY=http://proxy.example.com:8080`
   - When set, all YouTube downloads and metadata fetches will use the specified proxy
 
+- `YT2RSS_PASSWORD`: Management password (optional)
+  - When unset, the app stays open access and all URLs work exactly as before
+  - When set, the management UI and API require a login; pages redirect to
+    `/login` and API/media requests without credentials are rejected with 401
+  - Cookie flags: `HttpOnly`, `SameSite=Lax`; `Secure` is added when `BASE_URL`
+    starts with `https://`
+
+- `YT2RSS_USERNAME`: Login username (optional, default `admin`)
+
+- `YT2RSS_SECRET_KEY`: Flask session signing key (optional)
+  - When unset, a key is generated once and persisted to
+    `appdata/config/.session_secret` (mode 0600)
+
+### Private (tokenized) feed URLs
+
+When `YT2RSS_PASSWORD` is set, feeds become private:
+
+- Each channel has an opaque `feed_token` stored in `channels.yaml`. It is
+  generated on demand and shown in the UI.
+- Share `/feeds/<channel>?token=<feed_token>` with podcast apps; the feed's
+  enclosure and thumbnail URLs carry the same token, so apps fetch media and
+  images without a login session.
+- A token is only valid for its own channel and grants no access to the
+  management API.
+- "Rotate Token" in the channel card generates a new token; existing tokenized
+  URLs for that channel stop working immediately.
+- Without `YT2RSS_PASSWORD`, plain feed URLs keep working for everyone.
+- The standalone cron runner (`src/cron_runner.py`) is headless and unaffected.
+
 ## Development Setup
 
 For development or manual installation, this project uses UV for dependency management:
@@ -163,12 +192,20 @@ Requirements:
 
 ## Security Notes
 
-- Designed for a trusted local network; the management API has no authentication.
+- Designed for a trusted local network. Without `YT2RSS_PASSWORD` the
+  management API has no authentication.
+- With `YT2RSS_PASSWORD` set, management pages and API require login (signed
+  session cookie, constant-time password check, per-address failed-login
+  throttling). Feeds and media additionally accept a valid per-channel
+  `feed_token` in the `?token=` query parameter; tokens never grant management
+  API access.
 - Browser management requests must originate from the same origin. Feeds and
   media remain available across origins for podcast clients. Command-line API
-  clients can continue to call the API without an `Origin` header.
+  clients can continue to call the API without an `Origin` header while logged
+  in.
 - The built-in server serves HTTP. Use an authenticated HTTPS reverse proxy for
-  remote access and configure `BASE_URL` to match the public address.
+  remote access and configure `BASE_URL` to match the public address (also
+  enables the `Secure` cookie flag).
 - Run one web server process for a data directory so scheduling and configuration
   edits stay coordinated. On POSIX systems, the web server and standalone cron
   runner also share a file lock to prevent overlapping media operations.

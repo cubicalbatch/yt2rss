@@ -18,10 +18,11 @@ _timestamp_lock = threading.RLock()
 
 
 class RSSGenerator:
-    def __init__(self, base_url: str | None = None):
+    def __init__(self, base_url: str | None = None, feed_token: str | None = None):
         if base_url is None:
             base_url = os.getenv("BASE_URL", "http://localhost:5000")
         self.base_url = base_url.rstrip("/")
+        self.feed_token = feed_token
         self.logger = logging.getLogger(__name__)
         self.refresh_timestamps_file = (
             Path(__file__).parent.parent
@@ -29,6 +30,26 @@ class RSSGenerator:
             / "config"
             / "refresh_timestamps.json"
         )
+
+    def _tokenize_url(self, url: str) -> str:
+        """Append the private feed token to a generated URL when one is set."""
+        if not self.feed_token:
+            return url
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}token={quote(self.feed_token, safe='')}"
+
+    def _apply_feed_token(self, rss_content: str, plain_urls: list[str]) -> str:
+        """Rewrite generated feed URLs to carry the access token.
+
+        URLs are handed to feedgen in plain form (its iTunes extension rejects
+        image URLs that do not end in the file extension), so the token is
+        appended to the serialized XML afterwards.
+        """
+        if not self.feed_token:
+            return rss_content
+        for url in dict.fromkeys(plain_urls):
+            rss_content = rss_content.replace(url, self._tokenize_url(url))
+        return rss_content
 
     def sanitize_text(self, text: str) -> str:
         """Sanitize text for XML content"""
@@ -177,7 +198,8 @@ class RSSGenerator:
         )
 
         # Set feed metadata
-        feed_url = f"{self.base_url}/feeds/{quote(channel_name)}"
+        tokenizable_urls = [f"{self.base_url}/feeds/{quote(channel_name)}"]
+        feed_url = tokenizable_urls[0]
 
         fg.id(feed_url)
         fg.title(self.sanitize_text(display_title))
@@ -225,6 +247,7 @@ class RSSGenerator:
             episode_filename = f"{video['id']}{file_ext}"
             encoded_episode_filename = quote(episode_filename)
             episode_url = f"{self.base_url}/podcasts/{quote(channel_name)}/{encoded_episode_filename}"
+            tokenizable_urls.append(episode_url)
 
             # Determine MIME type based on file extension
             mime_type_map = {
@@ -253,6 +276,7 @@ class RSSGenerator:
                 thumbnail_path = video["thumbnail"]
                 if thumbnail_path.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
                     thumbnail_url = f"{self.base_url}/thumbnails/{quote(channel_name)}/{quote(Path(thumbnail_path).name)}"
+                    tokenizable_urls.append(thumbnail_url)
                     # Only add iTunes image for supported formats
                     if thumbnail_path.lower().endswith((".png", ".jpg", ".jpeg")):
                         podcast_ext = getattr(fe, "podcast", None)
@@ -269,7 +293,8 @@ class RSSGenerator:
 
             self.logger.debug(f"Added episode: {video['title']}")
 
-        return fg.rss_str(pretty=True).decode("utf-8")
+        rss_content = fg.rss_str(pretty=True).decode("utf-8")
+        return self._apply_feed_token(rss_content, tokenizable_urls)
 
     def generate_rss_feed_from_filesystem(
         self, channel_name: str, videos_dir: Path, display_name: str | None = None

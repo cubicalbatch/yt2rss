@@ -2,6 +2,7 @@
 Shared pytest configuration and fixtures.
 """
 
+import os
 import shutil
 import sys
 import tempfile
@@ -13,6 +14,19 @@ import pytest
 # Add the project root to the Python path to ensure imports work
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
+
+
+@pytest.fixture(autouse=True, scope="session")
+def clean_auth_environment():
+    """Keep ambient auth variables from flipping test servers into auth mode.
+
+    Tests that exercise authentication set these explicitly per test.
+    """
+    for name in ("YT2RSS_PASSWORD", "YT2RSS_USERNAME", "YT2RSS_SECRET_KEY"):
+        os.environ.pop(name, None)
+    yield
+    for name in ("YT2RSS_PASSWORD", "YT2RSS_USERNAME", "YT2RSS_SECRET_KEY"):
+        os.environ.pop(name, None)
 
 
 @pytest.fixture(scope="session")
