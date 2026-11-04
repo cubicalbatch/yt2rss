@@ -13,6 +13,10 @@ except ImportError:  # The web UI can still run with thread locking on Windows.
     fcntl = None
 
 MEDIA_EXTENSIONS = (".mp4", ".m4a", ".mp3", ".webm", ".mkv", ".avi")
+# Sane upper bounds for storage controls (GB / days).
+MAX_QUOTA_GB = 16384
+MAX_MIN_FREE_GB = 1024
+MAX_RETENTION_DAYS = 36500
 SPONSORBLOCK_CATEGORIES = {
     "sponsor",
     "selfpromo",
@@ -98,12 +102,40 @@ def atomic_write_text(path: Path, content: str) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def validate_bounded_number(field: str, value: Any, maximum: float) -> None:
+    """Require a finite number in ``[0, maximum]``; booleans are rejected.
+
+    Args:
+        field: Setting name used in the error message.
+        value: Candidate value.
+        maximum: Inclusive upper bound.
+
+    Raises:
+        ValueError: When the value is not a finite number in bounds.
+    """
+    if (
+        type(value) not in (int, float)
+        or not math.isfinite(value)
+        or value < 0
+        or value > maximum
+    ):
+        raise ValueError(f"{field} must be a number between 0 and {maximum:g}")
+
+
 def validate_channel_settings(data: dict[str, Any]) -> None:
     """Reject invalid settings before they reach scheduling or deletion logic."""
     if "max_episodes" in data:
         value = data["max_episodes"]
         if type(value) is not int or value <= 0:
             raise ValueError("max_episodes must be a positive integer")
+    for field, maximum in (
+        ("global_quota_gb", MAX_QUOTA_GB),
+        ("min_free_space_gb", MAX_MIN_FREE_GB),
+        ("retention_days", MAX_RETENTION_DAYS),
+        ("quota_gb", MAX_QUOTA_GB),
+    ):
+        if field in data:
+            validate_bounded_number(field, data[field], maximum)
     for field in (
         "download_delay_hours",
         "check_delay_seconds",
@@ -146,9 +178,25 @@ def validate_channel_settings(data: dict[str, Any]) -> None:
             )
 
 
-def cleanup_episodes(videos_dir: Path, channel_name: str, max_episodes: int) -> None:
-    """Prune completed episodes using filenames as the trusted identity."""
+def cleanup_episodes(
+    videos_dir: Path,
+    channel_name: str,
+    max_episodes: int,
+    pinned: set[str] | None = None,
+) -> None:
+    """Prune completed episodes using filenames as the trusted identity.
+
+    Pinned episodes are never removed; when pins occupy slots the channel
+    may keep more than ``max_episodes`` episodes.
+
+    Args:
+        videos_dir: Storage root containing the channel directory.
+        channel_name: Sanitized channel identifier.
+        max_episodes: Number of newest episodes to keep.
+        pinned: Episode ids that must never be deleted.
+    """
     validate_channel_settings({"max_episodes": max_episodes})
+    pinned = pinned or set()
     channel_dir = contained_path(videos_dir, channel_name)
     episodes = []
     for metadata_file in channel_dir.glob("*.json"):
@@ -169,7 +217,8 @@ def cleanup_episodes(videos_dir: Path, channel_name: str, max_episodes: int) -> 
             (str(metadata.get("upload_date") or ""), episode_id, metadata_file)
         )
     episodes.sort()
-    for _, episode_id, metadata_file in episodes[:-max_episodes]:
+    deletable = [entry for entry in episodes if entry[1] not in pinned]
+    for _, episode_id, metadata_file in deletable[:-max_episodes]:
         for ext in MEDIA_EXTENSIONS:
             contained_path(channel_dir, f"{episode_id}{ext}").unlink(missing_ok=True)
         thumbnails = contained_path(channel_dir, "thumbnails")

@@ -19,10 +19,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from .download_queue import DownloadQueue, QueueWorker, execute_queue_job
     from .downloader import YouTubeDownloader
+    from .storage import pinned_ids
     from .utils import cleanup_episodes, safe_component, validate_channel_settings
 except ImportError:
     from download_queue import DownloadQueue, QueueWorker, execute_queue_job
     from downloader import YouTubeDownloader
+    from storage import pinned_ids
     from utils import cleanup_episodes, safe_component, validate_channel_settings
 
 
@@ -193,7 +195,12 @@ class AutomationRunner:
     def cleanup_old_videos(self, channel_name: str, max_episodes: int):
         """Remove completed media files exceeding the configured limit."""
         try:
-            cleanup_episodes(self.videos_dir, channel_name, max_episodes)
+            cleanup_episodes(
+                self.videos_dir,
+                channel_name,
+                max_episodes,
+                pinned=pinned_ids(self.config_path.parent, channel_name),
+            )
         except Exception as error:
             self.logger.error(f"Error cleaning up {channel_name}: {error}")
 

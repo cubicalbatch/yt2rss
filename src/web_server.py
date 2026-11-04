@@ -52,6 +52,23 @@ try:
         execute_queue_job,
     )
     from .rss_generator import RSSGenerator
+    from .storage import (
+        GB,
+        admission_error,
+        apply_retention,
+        effective_channel_storage,
+        estimate_download_bytes,
+        free_disk_bytes,
+        is_positive_number,
+        load_pins,
+        load_storage_settings,
+        measure_media_usage,
+        pinned_ids,
+        remove_channel_pins,
+        remove_episode_pin,
+        set_episode_pinned,
+        validate_storage_settings,
+    )
     from .utils import (
         MEDIA_EXTENSIONS,
         MediaLock,
@@ -83,6 +100,23 @@ except ImportError:
         execute_queue_job,
     )
     from rss_generator import RSSGenerator
+    from storage import (
+        GB,
+        admission_error,
+        apply_retention,
+        effective_channel_storage,
+        estimate_download_bytes,
+        free_disk_bytes,
+        is_positive_number,
+        load_pins,
+        load_storage_settings,
+        measure_media_usage,
+        pinned_ids,
+        remove_channel_pins,
+        remove_episode_pin,
+        set_episode_pinned,
+        validate_storage_settings,
+    )
     from utils import (
         MEDIA_EXTENSIONS,
         MediaLock,
@@ -531,6 +565,20 @@ class YouTubePodcastServer:
                     f"Scheduled refresh for '{channel_name}' every {interval_hours} hours"
                 )
 
+            # Storage maintenance applies retention cleanup once at startup
+            # and then once per day.
+            self.scheduler.add_job(
+                func=self._run_storage_maintenance,
+                trigger=IntervalTrigger(days=1),
+                id="storage_maintenance",
+                name="Storage maintenance (retention)",
+                replace_existing=True,
+                misfire_grace_time=3600,
+                coalesce=True,
+                max_instances=1,
+                next_run_time=datetime.now(),
+            )
+
         except Exception as e:
             self.logger.error(f"Error setting up scheduler: {e}")
 
@@ -650,6 +698,7 @@ class YouTubePodcastServer:
                     "add_channel",
                     "update_channel",
                     "update_refresh_interval",
+                    "update_storage_config",
                 ):
                     data = request.get_json(silent=True)
                     if not isinstance(data, dict) or not data:
@@ -783,6 +832,21 @@ class YouTubePodcastServer:
             """Update refresh interval."""
             return self._handle_update_refresh_interval()
 
+        @self.app.route("/api/storage", methods=["GET"])
+        def get_storage():
+            """Report media usage, quotas, retention and free disk space."""
+            return self._handle_get_storage()
+
+        @self.app.route("/api/config/storage", methods=["GET"])
+        def get_storage_config():
+            """Get global storage settings."""
+            return self._handle_get_storage_config()
+
+        @self.app.route("/api/config/storage", methods=["PUT"])
+        def update_storage_config():
+            """Update global storage settings."""
+            return self._handle_update_storage_config()
+
         @self.app.route("/api/channels/<channel_name>/purge", methods=["POST"])
         def purge_channel_episodes(channel_name: str):
             """Purge downloaded episodes for a channel and regenerate RSS."""
@@ -824,6 +888,22 @@ class YouTubePodcastServer:
         def redownload_single_episode(channel_name: str, episode_id: str):
             """Redownload a single episode."""
             return self._handle_redownload_episode(channel_name, episode_id)
+
+        @self.app.route(
+            "/api/channels/<channel_name>/episodes/<episode_id>/pin",
+            methods=["POST"],
+        )
+        def pin_episode(channel_name: str, episode_id: str):
+            """Pin a single episode against automatic cleanup."""
+            return self._handle_pin_episode(channel_name, episode_id, True)
+
+        @self.app.route(
+            "/api/channels/<channel_name>/episodes/<episode_id>/pin",
+            methods=["DELETE"],
+        )
+        def unpin_episode(channel_name: str, episode_id: str):
+            """Remove an episode's pin."""
+            return self._handle_pin_episode(channel_name, episode_id, False)
 
         @self.app.route("/api/channels/<channel_name>/refresh", methods=["POST"])
         def refresh_single_channel(channel_name: str):
@@ -913,6 +993,7 @@ class YouTubePodcastServer:
                 try:
                     self._discover_channel_jobs(downloader, channel, global_config)
                     self._cleanup_old_episodes(channel["name"], channel["max_episodes"])
+                    self._apply_channel_retention(channel, global_config)
                     self._add_log_message(f"Refresh completed for {channel['name']}")
                 except Exception as error:
                     self.logger.error(f"Refresh failed for {channel['name']}: {error}")
@@ -937,7 +1018,9 @@ class YouTubePodcastServer:
 
         Mirrors the checks ``process_channel`` used to apply inline: skip
         already downloaded videos, fetch per-video metadata, and respect
-        ``download_delay_hours`` plus ``check_delay_seconds``.
+        ``download_delay_hours`` plus ``check_delay_seconds``. Videos that
+        would exceed the storage quota or the free-space minimum are not
+        queued; the block is logged as a warning instead.
 
         Args:
             downloader: Downloader used for discovery only.
@@ -968,6 +1051,15 @@ class YouTubePodcastServer:
             "download_delay_hours": download_delay_hours,
             "download_delay_seconds": global_config.get("download_delay_seconds", 60),
         }
+        settings = load_storage_settings(global_config)
+        usage = measure_media_usage(self.videos_dir)
+        try:
+            free_bytes: int | None = free_disk_bytes(self.videos_dir)
+            free_error = None
+        except OSError as error:
+            free_bytes = None
+            free_error = str(error)
+        channel_dir = contained_path(self.videos_dir, channel_name)
 
         queued_count = 0
         for index, video in enumerate(videos, 1):
@@ -993,12 +1085,37 @@ class YouTubePodcastServer:
                 self._apply_check_delay(check_delay_seconds, index, len(videos))
                 continue
 
+            if free_error is not None:
+                blocked = f"Free disk space check failed: {free_error}"
+            else:
+                blocked = admission_error(
+                    settings=settings,
+                    channel=channel,
+                    channel_dir=channel_dir,
+                    videos_dir=self.videos_dir,
+                    format_type=format_type,
+                    metadata_bytes=video.get("filesize"),
+                    usage_totals=usage,
+                    free_bytes=free_bytes,
+                )
+            if blocked is not None:
+                # Log instead of enqueueing so a full disk does not create
+                # endless retry jobs; the next refresh tries again.
+                self.logger.warning(f"⛔ Not queuing {title}: {blocked}")
+                self._add_log_message(f"⛔ Not queuing {title}: {blocked}")
+                self._apply_check_delay(check_delay_seconds, index, len(videos))
+                continue
+
+            estimated_bytes = estimate_download_bytes(
+                channel_dir, format_type, video.get("filesize")
+            )
             job = self.queue.enqueue(
                 channel=channel_name,
                 video_id=video_id,
                 title=title,
                 url=video["url"],
                 snapshot=snapshot,
+                estimated_bytes=estimated_bytes,
             )
             if job is None:
                 self._add_log_message(f"↩️  Already queued: {title}")
@@ -1029,9 +1146,71 @@ class YouTubePodcastServer:
     def _cleanup_old_episodes(self, channel_name: str, max_episodes: int):
         """Remove completed episodes exceeding the configured limit."""
         try:
-            cleanup_episodes(self.videos_dir, channel_name, max_episodes)
+            cleanup_episodes(
+                self.videos_dir,
+                channel_name,
+                max_episodes,
+                pinned=pinned_ids(self.config_dir, channel_name),
+            )
         except Exception as error:
             self.logger.error(f"Error cleaning up {channel_name}: {error}")
+
+    def _apply_channel_retention(
+        self, channel: dict[str, Any], global_config: dict[str, Any]
+    ) -> int:
+        """Delete episodes past the channel's effective retention window.
+
+        Args:
+            channel: Channel configuration entry.
+            global_config: Configuration keys outside ``channels``.
+
+        Returns:
+            The number of episodes deleted.
+        """
+        try:
+            effective = effective_channel_storage(
+                load_storage_settings(global_config), channel
+            )
+            if effective["retention_days"] <= 0:
+                return 0
+            pinned = pinned_ids(self.config_dir, channel["name"])
+            removed = apply_retention(
+                self.videos_dir,
+                channel["name"],
+                effective["retention_days"],
+                pinned=pinned,
+                logger=self.logger,
+            )
+            if removed:
+                self._add_log_message(
+                    f"🗑️  Retention removed {removed} old episode(s) "
+                    f"from {channel['name']}"
+                )
+            return removed
+        except Exception as error:
+            self.logger.error(f"Retention failed for {channel['name']}: {error}")
+            return 0
+
+    def _run_storage_maintenance(self) -> None:
+        """Apply retention cleanup for every channel (startup and daily)."""
+        if not self._media_lock.acquire(blocking=False):
+            self.logger.info(
+                "Storage maintenance skipped; a media operation is in progress"
+            )
+            return
+        try:
+            config = self._load_channel_config()
+            total = 0
+            for channel in config.get("channels", []):
+                total += self._apply_channel_retention(channel, config)
+            if total:
+                self.logger.info(
+                    f"Storage maintenance removed {total} episode(s) by retention"
+                )
+        except Exception as error:
+            self.logger.error(f"Storage maintenance failed: {error}")
+        finally:
+            self._media_lock.release()
 
     def _run_automation_script(self):
         """Run a reserved refresh for all channels."""
@@ -1248,6 +1427,152 @@ class YouTubePodcastServer:
             self.logger.error(f"Error updating refresh interval: {e}")
             return jsonify({"error": "Internal server error"}), 500
 
+    def _handle_get_storage(self):
+        """Report media usage, quotas, retention and free disk space.
+
+        Accounting counts only regular media files (``MEDIA_EXTENSIONS``);
+        thumbnails and ``*.json`` metadata are excluded. Symlinks are never
+        followed, so nothing outside the storage root is counted.
+        """
+        try:
+            config = self._load_channel_config()
+            settings = load_storage_settings(config)
+            pins = load_pins(self.config_dir)
+            usage = measure_media_usage(self.videos_dir)
+            free_bytes = free_disk_bytes(self.videos_dir)
+
+            channels = []
+            totals_bytes = 0
+            totals_episodes = 0
+            totals_pinned = 0
+            for channel in config.get("channels", []):
+                name = channel["name"]
+                stats = usage.get(name, {"bytes": 0, "episodes": 0})
+                effective = effective_channel_storage(settings, channel)
+                pinned_count = len(pins.get(name, []))
+                quota_bytes = effective["quota_gb"] * GB
+                quota_override = channel.get("quota_gb", 0)
+                retention_override = channel.get("retention_days", 0)
+                channels.append(
+                    {
+                        "name": name,
+                        "display_name": channel.get("display_name", name),
+                        "used_bytes": stats["bytes"],
+                        "episodes": stats["episodes"],
+                        "pinned": pinned_count,
+                        "quota_gb": effective["quota_gb"],
+                        "quota_overridden": is_positive_number(quota_override),
+                        "retention_days": effective["retention_days"],
+                        "retention_overridden": is_positive_number(retention_override),
+                        "over_quota": bool(quota_bytes)
+                        and stats["bytes"] > quota_bytes,
+                    }
+                )
+                totals_bytes += stats["bytes"]
+                totals_episodes += stats["episodes"]
+                totals_pinned += pinned_count
+
+            return jsonify(
+                {
+                    "totals": {
+                        "used_bytes": totals_bytes,
+                        "used_gb": round(totals_bytes / GB, 2),
+                        "episodes": totals_episodes,
+                        "pinned": totals_pinned,
+                    },
+                    "free_bytes": free_bytes,
+                    "free_gb": round(free_bytes / GB, 2),
+                    "settings": settings,
+                    "channels": channels,
+                    "accounting": (
+                        "media files only; thumbnails and metadata excluded"
+                    ),
+                }
+            ), 200
+        except OSError as e:
+            self.logger.error(f"Error measuring storage: {e}")
+            return jsonify({"error": "Failed to measure storage"}), 500
+        except Exception as e:
+            self.logger.error(f"Error getting storage info: {e}")
+            return jsonify({"error": "Failed to get storage info"}), 500
+
+    def _handle_get_storage_config(self):
+        """Return the effective global storage settings."""
+        try:
+            config = self._load_channel_config()
+            return jsonify(load_storage_settings(config)), 200
+        except Exception as e:
+            self.logger.error(f"Error getting storage settings: {e}")
+            return jsonify({"error": "Failed to get storage settings"}), 500
+
+    @config_transaction
+    def _handle_update_storage_config(self):
+        """Validate, persist and return the global storage settings."""
+        try:
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict) or not data:
+                return jsonify(
+                    {"error": "No data provided; expected a JSON object"}
+                ), 400
+            try:
+                validate_storage_settings(data)
+            except (ValueError, OverflowError) as error:
+                return jsonify({"error": str(error)}), 400
+
+            config = self._load_channel_config()
+            settings = load_storage_settings(config)
+            settings.update(data)
+            config["storage"] = settings
+
+            if not self._save_channel_config(config):
+                return jsonify({"error": "Failed to save storage settings"}), 500
+            return jsonify(
+                {
+                    "message": "Storage settings updated successfully",
+                    "storage": settings,
+                }
+            ), 200
+        except Exception as e:
+            self.logger.error(f"Error updating storage settings: {e}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    def _handle_pin_episode(self, channel_name: str, episode_id: str, pinned: bool):
+        """Pin or unpin one downloaded episode.
+
+        Pins survive metadata rewrites and redownloads; cleanup and
+        retention never delete pinned episodes. Deleting the episode or
+        its channel removes the pin.
+        """
+        try:
+            config = self._load_channel_config()
+            if not any(ch["name"] == channel_name for ch in config.get("channels", [])):
+                return jsonify({"error": "Channel not found"}), 404
+
+            channel_dir = self.videos_dir / channel_name
+            has_media = any(
+                (channel_dir / f"{episode_id}{ext}").is_file()
+                for ext in MEDIA_EXTENSIONS
+            )
+            if not (channel_dir / f"{episode_id}.json").is_file() or not has_media:
+                return jsonify({"error": "Episode not found"}), 404
+
+            if not set_episode_pinned(
+                self.config_dir, channel_name, episode_id, pinned
+            ):
+                return jsonify({"error": "Failed to save pin"}), 500
+            return jsonify(
+                {
+                    "message": "Episode pinned" if pinned else "Episode unpinned",
+                    "episode_id": episode_id,
+                    "pinned": pinned,
+                }
+            ), 200
+        except Exception as e:
+            self.logger.error(
+                f"Error toggling pin for {channel_name}/{episode_id}: {e}"
+            )
+            return jsonify({"error": "Internal server error"}), 500
+
     def _validate_display_name(
         self,
         display_name: str,
@@ -1415,6 +1740,12 @@ class YouTubePodcastServer:
                     if "refresh_interval_hours" in data
                     else {}
                 ),
+                **({"quota_gb": data["quota_gb"]} if "quota_gb" in data else {}),
+                **(
+                    {"retention_days": data["retention_days"]}
+                    if "retention_days" in data
+                    else {}
+                ),
                 "sponsorblock_categories": data.get("sponsorblock_categories", []),
                 "feed_token": generate_feed_token(),
             }
@@ -1509,6 +1840,10 @@ class YouTubePodcastServer:
 
             if "refresh_interval_hours" in data:
                 channel["refresh_interval_hours"] = data["refresh_interval_hours"]
+            if "quota_gb" in data:
+                channel["quota_gb"] = data["quota_gb"]
+            if "retention_days" in data:
+                channel["retention_days"] = data["retention_days"]
 
             # Save config
             if self._save_channel_config(config):
@@ -1548,6 +1883,8 @@ class YouTubePodcastServer:
             if self._save_channel_config(config):
                 # Restart scheduler to remove deleted channel's job
                 self._setup_scheduler()
+                # Pins have no meaning once the channel is gone.
+                remove_channel_pins(self.config_dir, channel_name)
 
                 return jsonify({"message": "Channel deleted successfully"}), 200
             else:
@@ -1596,6 +1933,7 @@ class YouTubePodcastServer:
             # Remove all video files and directories for this channel
             try:
                 shutil.rmtree(str(channel_video_dir))
+                remove_channel_pins(self.config_dir, channel_name)
                 self.logger.info(f"Purged all episodes for channel: {channel_name}")
             except FileNotFoundError:
                 pass  # Directory already doesn't exist
@@ -1662,6 +2000,7 @@ class YouTubePodcastServer:
 
             channel_path = self.videos_dir / channel_name
             episodes_data = rss_generator.scan_channel_videos(channel_path)
+            pinned = pinned_ids(self.config_dir, channel_name)
 
             # Format episodes for the frontend
             episodes = []
@@ -1713,6 +2052,7 @@ class YouTubePodcastServer:
                         "upload_date": episode.get(
                             "upload_date", ""
                         ),  # Keep original upload_date for sorting
+                        "pinned": episode.get("id", "") in pinned,
                     }
                 )
 
@@ -2069,6 +2409,9 @@ class YouTubePodcastServer:
 
             if not removed_files:
                 return jsonify({"error": "No files found to delete"}), 404
+
+            # The pin dies with the episode it protected.
+            remove_episode_pin(self.config_dir, channel_name, episode_id)
 
             # RSS feed will automatically reflect changes on next request (dynamic generation)
             self.logger.info(

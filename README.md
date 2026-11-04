@@ -85,6 +85,8 @@ channels:
     refresh_interval_hours: 24  # Individual channel refresh interval
     format: video              # video or audio
     quality: max               # max, best, 480p, 720p, or 1080p
+    quota_gb: 20               # 0 or absent: inherit the global quota
+    retention_days: 90         # 0 or absent: inherit the global retention
     sponsorblock_categories:
       - sponsor
       - selfpromo
@@ -142,6 +144,56 @@ Queue management API (session-authenticated when `YT2RSS_PASSWORD` is set):
 from queue draining. The standalone cron runner drains leftover queue jobs
 with the same store before its normal discovery pass; it never corrupts the
 queue file and holds the same `media.lock` while downloading.
+
+### Storage Controls
+
+Storage settings live under the `storage:` key in `channels.yaml`
+(missing keys fall back to the defaults):
+
+```yaml
+storage:
+  global_quota_gb: 0     # Stop new downloads when total media would exceed this. 0 = unlimited.
+  min_free_space_gb: 1   # Pause new downloads below this much free disk space. 0 = disabled.
+  retention_days: 0      # Delete episodes older than this many days. 0 = disabled.
+```
+
+How enforcement works:
+
+- **Quotas and free space only block new downloads** — media is never
+  deleted automatically because a quota is exceeded. Only an explicit
+  `retention_days` (global or per channel) deletes episodes.
+- The checks run twice: during refresh discovery (a blocked video is
+  logged and skipped instead of queued, so a full disk cannot create
+  endless retry jobs) and again before a queued job executes. A blocked
+  job lands in the terminal `failed` state with an actionable message such
+  as `Global storage quota exceeded: 12.3/10.0 GB`; use the queue's Retry
+  action once space is freed.
+- Quota estimates use the worst of: yt-dlp's reported size hint, the
+  largest episode already stored for the channel, and a per-format default
+  (2 GB video, 200 MB audio).
+- Retention runs after every channel refresh, once at startup, and daily
+  via the scheduler. Episodes are evaluated by upload date (metadata) with
+  the file mtime as fallback, deleted oldest first, and each deletion is
+  logged. **Pinned episodes are never deleted**, by retention or by
+  `max_episodes` cleanup.
+- **Pins** are stored in `appdata/config/pins.json` and survive episode
+  redownloads and metadata rewrites. They are removed only when the
+  episode (delete) or its channel (purge/delete) is removed.
+
+Storage API (session-authenticated when `YT2RSS_PASSWORD` is set):
+
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/api/storage` | GET | Totals, free disk space, configured quotas/retention, per-channel usage with over-quota flag, and pinned counts. Usage counts only media files — thumbnails and metadata are excluded; symlinks are never followed. |
+| `/api/config/storage` | GET | Effective global storage settings (with defaults applied). |
+| `/api/config/storage` | PUT | Validate, atomically persist and return the global storage settings. |
+| `/api/channels/<channel>/episodes/<episode_id>/pin` | POST | Pin an episode against automatic cleanup (404 for unknown channel/episode). |
+| `/api/channels/<channel>/episodes/<episode_id>/pin` | DELETE | Remove an episode's pin. |
+
+`GET /api/channels/<channel>/episodes` includes a `pinned` flag per episode.
+The web UI adds a storage panel with usage/quota bars and a free-space
+warning, storage fields in the scheduler modal, per-channel quota and
+retention fields in the channel modal, and a pin toggle in the episode list.
 
 ### SponsorBlock Categories
 

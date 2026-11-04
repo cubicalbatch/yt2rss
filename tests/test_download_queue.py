@@ -1059,5 +1059,8 @@ class TestRefreshIntegration:
                     lambda: test_server.queue.get(job["id"])["state"] == "completed"
                 )
                 cleanup.assert_called_once_with(
-                    test_server.videos_dir, "test_channel", 5
+                    test_server.videos_dir,
+                    "test_channel",
+                    5,
+                    pinned=set(),
                 )

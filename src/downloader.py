@@ -15,6 +15,12 @@ from PIL import Image
 try:
     from .download_queue import DownloadCancelled
     from .rss_generator import RSSGenerator
+    from .storage import (
+        admission_error,
+        free_disk_bytes,
+        load_storage_settings,
+        measure_media_usage,
+    )
     from .utils import (
         contained_path,
         safe_component,
@@ -24,6 +30,12 @@ try:
 except ImportError:
     from download_queue import DownloadCancelled
     from rss_generator import RSSGenerator
+    from storage import (
+        admission_error,
+        free_disk_bytes,
+        load_storage_settings,
+        measure_media_usage,
+    )
     from utils import (
         contained_path,
         safe_component,
@@ -164,6 +176,7 @@ class YouTubeDownloader:
                         "upload_date": info.get("upload_date"),
                         "timestamp": info.get("timestamp"),
                         "duration": info.get("duration"),
+                        "filesize": info.get("filesize") or info.get("filesize_approx"),
                         "url": video_url,
                     }
                 else:
@@ -519,6 +532,16 @@ class YouTubeDownloader:
         downloaded_count = 0
         self.logger.info(f"\n🔍 Checking {len(videos)} videos for download...")
 
+        # Storage controls: quota and free-space checks reuse the discovery
+        # snapshot so large libraries are measured once per channel run.
+        storage_settings = load_storage_settings(global_config)
+        usage_totals = measure_media_usage(self.videos_dir)
+        try:
+            free_bytes: int | None = free_disk_bytes(self.videos_dir)
+        except OSError as error:
+            self.logger.warning(f"Free disk space check failed: {error}")
+            free_bytes = None
+
         def apply_check_delay():
             """Apply check delay if configured and not on last video."""
             if check_delay_seconds > 0 and i < len(videos):
@@ -555,6 +578,21 @@ class YouTubeDownloader:
                 self.logger.info(
                     f"   ⌛ Video too new (< {download_delay_hours}h old), skipping for SponsorBlock data"
                 )
+                apply_check_delay()
+                continue
+
+            blocked = admission_error(
+                settings=storage_settings,
+                channel=channel_config,
+                channel_dir=contained_path(self.videos_dir, channel_name),
+                videos_dir=self.videos_dir,
+                format_type=format_type,
+                metadata_bytes=video.get("filesize"),
+                usage_totals=usage_totals,
+                free_bytes=free_bytes,
+            )
+            if blocked is not None:
+                self.logger.warning(f"   ⛔ Not downloading: {blocked}")
                 apply_check_delay()
                 continue
 

@@ -61,6 +61,20 @@
                 <!-- Queue jobs will be populated here -->
             </div>
         </div>
+
+        <!-- Storage panel -->
+        <div id="storagePanel" class="queue-panel storage-panel" style="display: none;">
+            <div class="queue-header" onclick="toggleStoragePanel()">
+                <h3>💾 Storage</h3>
+                <div class="queue-header-right">
+                    <span id="storageSummary" class="queue-summary"></span>
+                    <button class="logs-collapse">+</button>
+                </div>
+            </div>
+            <div id="storageContent" class="queue-content" style="display: none;">
+                <!-- Storage usage will be populated here -->
+            </div>
+        </div>
         
         {% if podcasts %}
         <div class="podcasts-grid">
@@ -234,6 +248,31 @@
                         </select>
                     </div>
                 </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label" for="channelQuota">
+                            Quota (GB)
+                            <span class="tooltip">
+                                <span class="tooltip-trigger">?</span>
+                                <span class="tooltip-content">Per-channel storage quota. New downloads for this channel are blocked once the quota would be exceeded. Nothing is deleted automatically. 0 inherits the global quota.</span>
+                            </span>
+                        </label>
+                        <input type="number" id="channelQuota" class="form-input"
+                               placeholder="0 = inherit global" min="0" max="16384" step="any">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="channelRetention">
+                            Retention (days)
+                            <span class="tooltip">
+                                <span class="tooltip-trigger">?</span>
+                                <span class="tooltip-content">Delete this channel's episodes older than this many days, oldest first. Pinned episodes are never deleted. 0 inherits the global retention setting.</span>
+                            </span>
+                        </label>
+                        <input type="number" id="channelRetention" class="form-input"
+                               placeholder="0 = inherit global" min="0" max="36500" step="1">
+                    </div>
+                </div>
                 
                 <div class="form-group">
                     <label class="form-label">
@@ -328,7 +367,45 @@
                            placeholder="24" min="1" max="168" step="1" required>
                     <div class="form-help">How often to automatically refresh all channels (1-168 hours)</div>
                 </div>
-                
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label" for="globalQuota">
+                            Global Quota (GB)
+                            <span class="tooltip">
+                                <span class="tooltip-trigger">?</span>
+                                <span class="tooltip-content">Stop new downloads when total media storage would exceed this size. Existing episodes are never deleted automatically. 0 means unlimited.</span>
+                            </span>
+                        </label>
+                        <input type="number" id="globalQuota" class="form-input"
+                               placeholder="0 = unlimited" min="0" max="16384" step="any">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="minFreeSpace">
+                            Minimum Free Space (GB)
+                            <span class="tooltip">
+                                <span class="tooltip-trigger">?</span>
+                                <span class="tooltip-content">Pause new downloads when free disk space drops below this value. 0 disables the low-space protection.</span>
+                            </span>
+                        </label>
+                        <input type="number" id="minFreeSpace" class="form-input"
+                               placeholder="1" min="0" max="1024" step="any">
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label" for="retentionDays">
+                        Retention (days)
+                        <span class="tooltip">
+                            <span class="tooltip-trigger">?</span>
+                            <span class="tooltip-content">Automatically delete episodes older than this many days, oldest first, based on their upload date. Pinned episodes are never deleted. 0 disables retention.</span>
+                        </span>
+                    </label>
+                    <input type="number" id="retentionDays" class="form-input"
+                           placeholder="0 = disabled" min="0" max="36500" step="1">
+                    <div class="form-help">Runs at startup, once per day, and after every refresh. Pinned episodes are never deleted.</div>
+                </div>
+
                 <div class="schedule-info" id="scheduleInfo">
                     <div class="info-item">
                         <span class="info-label">Current Interval:</span>

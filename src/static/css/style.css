@@ -1055,6 +1055,32 @@ select.form-input option {
     transform: none;
 }
 
+/* Pin toggle button */
+.pin-btn {
+    background: rgba(245, 158, 11, 0.14);
+    color: var(--accent-bright);
+    border-color: rgba(245, 158, 11, 0.35);
+}
+
+.pin-btn:hover {
+    background: rgba(245, 158, 11, 0.24);
+    border-color: rgba(245, 158, 11, 0.6);
+    box-shadow: 0 2px 8px var(--glow);
+    transform: translateY(-1px);
+}
+
+/* Pin badge shown next to protected episodes */
+.pin-badge {
+    flex-shrink: 0;
+    margin-left: 8px;
+    font-size: 0.8rem;
+    padding: 2px 7px;
+    border-radius: 10px;
+    background: rgba(245, 158, 11, 0.16);
+    border: 1px solid rgba(245, 158, 11, 0.4);
+    box-shadow: 0 0 8px var(--glow);
+}
+
 .episode-item:hover {
     border-color: var(--border-strong);
     box-shadow: 0 4px 14px var(--glow);
@@ -1445,6 +1471,69 @@ select.form-input option {
     color: var(--accent-bright);
     border-color: var(--accent);
     transform: translateY(-1px);
+}
+
+/* ---------- Storage panel ---------- */
+.storage-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.storage-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+}
+
+.storage-row.storage-warning {
+    border-left-color: var(--danger);
+}
+
+.storage-warning .storage-text {
+    color: var(--danger);
+}
+
+.storage-label {
+    flex: 0 0 130px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.storage-bar-track {
+    flex: 1;
+    height: 14px;
+    border-radius: 7px;
+    background: var(--surface-3);
+    overflow: hidden;
+}
+
+.storage-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent) 0%, var(--accent-bright) 100%);
+    box-shadow: 0 0 12px var(--glow);
+    transition: width 0.3s ease;
+}
+
+.storage-bar-fill.over {
+    background: linear-gradient(90deg, var(--danger) 0%, #f97316 100%);
+    box-shadow: 0 0 12px rgba(239, 68, 68, 0.4);
+}
+
+.storage-text {
+    flex: 0 0 auto;
+    font-size: 0.8rem;
+    color: var(--muted);
+    white-space: nowrap;
 }
 
 /* ---------- Responsive ---------- */

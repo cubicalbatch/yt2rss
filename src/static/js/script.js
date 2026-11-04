@@ -170,14 +170,15 @@ async function openScheduleModal() {
     try {
         const response = await fetch('/api/config/refresh-interval');
         const data = await response.json();
-        
+
         if (response.ok) {
             document.getElementById('refreshInterval').value = data.refresh_interval_hours;
             document.getElementById('currentInterval').textContent = `${data.refresh_interval_hours} hours`;
-            
+
             const nextRun = data.next_run ? formatDateTime(data.next_run) : 'Not scheduled';
             document.getElementById('nextRun').textContent = nextRun;
-            
+
+            await populateStorageSettings();
             document.getElementById('scheduleModal').style.display = 'block';
         } else {
             showToast('❌ Failed to load scheduler settings');
@@ -186,6 +187,15 @@ async function openScheduleModal() {
         console.error('Error loading scheduler settings:', error);
         showToast('❌ Network error occurred');
     }
+}
+
+async function populateStorageSettings() {
+    const storageResponse = await fetch('/api/config/storage');
+    if (!storageResponse.ok) return;
+    const storage = await storageResponse.json();
+    document.getElementById('globalQuota').value = storage.global_quota_gb > 0 ? storage.global_quota_gb : '';
+    document.getElementById('minFreeSpace').value = storage.min_free_space_gb;
+    document.getElementById('retentionDays').value = storage.retention_days > 0 ? storage.retention_days : '';
 }
 
 function closeScheduleModal() {
@@ -207,7 +217,9 @@ function populateForm(channel) {
     document.getElementById('downloadDelay').value = channel.download_delay_hours || '';
     document.getElementById('format').value = channel.format || 'video';
     document.getElementById('quality').value = channel.quality || 'max';
-    
+    document.getElementById('channelQuota').value = channel.quota_gb > 0 ? channel.quota_gb : '';
+    document.getElementById('channelRetention').value = channel.retention_days > 0 ? channel.retention_days : '';
+
     // Set SponsorBlock categories
     const categories = channel.sponsorblock_categories || [];
     const checkboxes = document.querySelectorAll('#channelForm input[type="checkbox"]');
@@ -224,6 +236,8 @@ function getFormData() {
         download_delay_hours: parseInt(document.getElementById('downloadDelay').value) || 6,
         format: document.getElementById('format').value || 'video',
         quality: document.getElementById('quality').value || 'max',
+        quota_gb: parseFloat(document.getElementById('channelQuota').value) || 0,
+        retention_days: parseInt(document.getElementById('channelRetention').value) || 0,
         sponsorblock_categories: []
     };
     
@@ -353,40 +367,60 @@ async function deleteChannelFromDangerZone() {
 // Scheduler form submission
 async function handleScheduleSubmit(event) {
     event.preventDefault();
-    
+
     const refreshInterval = parseInt(document.getElementById('refreshInterval').value);
-    
+
     if (!refreshInterval || refreshInterval < 1 || refreshInterval > 168) {
         showToast('❌ Refresh interval must be between 1 and 168 hours');
         return;
     }
-    
+
+    const storagePayload = {
+        global_quota_gb: parseFloat(document.getElementById('globalQuota').value) || 0,
+        min_free_space_gb: parseFloat(document.getElementById('minFreeSpace').value),
+        retention_days: parseInt(document.getElementById('retentionDays').value) || 0,
+    };
+    if (!Number.isFinite(storagePayload.min_free_space_gb) || storagePayload.min_free_space_gb < 0) {
+        showToast('❌ Minimum free space must be a non-negative number');
+        return;
+    }
+
     try {
-        const response = await fetch('/api/config/refresh-interval', {
+        const intervalResponse = await fetch('/api/config/refresh-interval', {
             method: 'PUT',
             headers: {
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({ refresh_interval_hours: refreshInterval })
         });
-        
-        const result = await response.json();
-        
-        if (response.ok) {
-            showToast('✅ Refresh interval updated successfully!');
-            
-            // Update the display
-            document.getElementById('currentInterval').textContent = `${refreshInterval} hours`;
-            const nextRun = result.next_run ? formatDateTime(result.next_run) : 'Not scheduled';
-            document.getElementById('nextRun').textContent = nextRun;
-            
-            closeScheduleModal();
-        } else {
-            showToast(`❌ ${result.error || 'Failed to update refresh interval'}`);
+        const intervalResult = await intervalResponse.json();
+        if (!intervalResponse.ok) {
+            throw new Error(intervalResult.error || 'Failed to update refresh interval');
         }
+
+        const storageResponse = await fetch('/api/config/storage', {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(storagePayload)
+        });
+        if (!storageResponse.ok) {
+            const storageResult = await storageResponse.json();
+            throw new Error(storageResult.error || 'Failed to update storage settings');
+        }
+
+        showToast('✅ Settings updated successfully!');
+
+        // Update the display
+        document.getElementById('currentInterval').textContent = `${refreshInterval} hours`;
+        const nextRun = intervalResult.next_run ? formatDateTime(intervalResult.next_run) : 'Not scheduled';
+        document.getElementById('nextRun').textContent = nextRun;
+
+        closeScheduleModal();
     } catch (error) {
-        console.error('Error updating refresh interval:', error);
-        showToast('❌ Network error occurred');
+        console.error('Error updating schedule settings:', error);
+        showToast(`❌ ${error.message || 'Network error occurred'}`);
     }
 }
 
@@ -451,6 +485,12 @@ async function openEpisodesModal(channelName, displayName) {
                         meta.append(field);
                     }
                     header.append(title, meta);
+                    if (episode.pinned) {
+                        const badge = document.createElement('span');
+                        badge.className = 'pin-badge';
+                        badge.textContent = '📌';
+                        header.append(badge);
+                    }
                     const description = document.createElement('div');
                     description.className = 'episode-description';
                     description.textContent = episode.description;
@@ -464,6 +504,7 @@ async function openEpisodesModal(channelName, displayName) {
                         ['download-original-btn', '📁 Download Original', button => downloadOriginalFile(channelName, episode.id, extension, button)],
                         ['redownload-btn', '🔄 Redownload', button => redownloadEpisode(channelName, episode.id, episode.title, button)],
                         ['delete-btn', '🗑️ Delete', button => deleteEpisode(channelName, episode.id, episode.title, button)],
+                        ['pin-btn', episode.pinned ? '📍 Unpin' : '📌 Pin', button => togglePin(channelName, episode.id, Boolean(episode.pinned), button)],
                     ];
                     for (const [className, label, action] of definitions) {
                         const button = document.createElement('button');
@@ -752,6 +793,49 @@ async function redownloadEpisode(channelName, episodeId, episodeTitle, button) {
             button.textContent = originalText;
             button.disabled = false;
         }, 3000);
+    }
+}
+
+async function togglePin(channelName, episodeId, pinned, button) {
+    const originalText = button.textContent;
+
+    try {
+        button.textContent = '⏳ Saving...';
+        button.disabled = true;
+
+        const response = await fetch(`/api/channels/${encodeURIComponent(channelName)}/episodes/${encodeURIComponent(episodeId)}/pin`, {
+            method: pinned ? 'DELETE' : 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            }
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || 'Pin toggle failed');
+        }
+
+        // Flip the button and the badge in place so the list needs no reload.
+        button.textContent = pinned ? '📌 Pin' : '📍 Unpin';
+        button.disabled = false;
+        const item = button.closest('.episode-item');
+        const badge = item ? item.querySelector('.pin-badge') : null;
+        if (!pinned && !badge && item) {
+            const header = item.querySelector('.episode-header');
+            const marker = document.createElement('span');
+            marker.className = 'pin-badge';
+            marker.textContent = '📌';
+            header.append(marker);
+        } else if (pinned && badge) {
+            badge.remove();
+        }
+        showToast(pinned ? '📌 Episode unpinned' : '📌 Episode pinned — protected from cleanup');
+    } catch (error) {
+        console.error('Error toggling pin:', error);
+        button.textContent = originalText;
+        button.disabled = false;
+        showToast('❌ ' + (error.message || 'Pin toggle failed'));
     }
 }
 
@@ -1097,6 +1181,143 @@ function startQueuePolling() {
     queuePollTimer = setInterval(refreshQueuePanel, 2000);
 }
 
+// Storage panel
+let storagePanelExpanded = false;
+const BYTES_PER_GB = 1024 * 1024 * 1024;
+
+function formatGb(bytes) {
+    if (typeof bytes !== 'number' || bytes < 0) return '—';
+    if (bytes >= BYTES_PER_GB) {
+        return (bytes / BYTES_PER_GB).toFixed(bytes >= 10 * BYTES_PER_GB ? 1 : 2) + ' GB';
+    }
+    return (bytes / (1024 * 1024)).toFixed(0) + ' MB';
+}
+
+async function refreshStoragePanel() {
+    let data;
+    try {
+        const response = await fetch('/api/storage');
+        if (response.status === 401) {
+            // Authentication required; the panel stays hidden until login.
+            renderStorage(null);
+            return;
+        }
+        if (!response.ok) return;
+        data = await response.json();
+    } catch (error) {
+        console.error('Error fetching storage info:', error);
+        return;
+    }
+    renderStorage(data);
+}
+
+function storageRow(label, usedBytes, quotaGb, extra, over) {
+    const row = document.createElement('div');
+    row.className = 'storage-row';
+    const name = document.createElement('span');
+    name.className = 'storage-label';
+    name.textContent = label;
+    const track = document.createElement('div');
+    track.className = 'storage-bar-track';
+    const fill = document.createElement('div');
+    fill.className = 'storage-bar-fill' + (over ? ' over' : '');
+    let percent = null;
+    if (quotaGb > 0) {
+        percent = quotaGb * BYTES_PER_GB > 0 ? (usedBytes / (quotaGb * BYTES_PER_GB)) * 100 : 0;
+        fill.style.width = Math.min(100, Math.max(0, percent)) + '%';
+    }
+    track.append(fill);
+    const text = document.createElement('span');
+    text.className = 'storage-text';
+    const quotaText = quotaGb > 0 ? ` / ${quotaGb} GB` : '';
+    text.textContent = `${formatGb(usedBytes)}${quotaText}${extra ? ' · ' + extra : ''}`;
+    row.append(name, track, text);
+    return { row, percent };
+}
+
+function renderStorage(data) {
+    const panel = document.getElementById('storagePanel');
+    if (!panel) return;
+    if (!data) {
+        panel.style.display = 'none';
+        return;
+    }
+
+    const settings = data.settings || {};
+    const channels = data.channels || [];
+    const minFreeGb = settings.min_free_space_gb || 0;
+    const lowFree = typeof data.free_bytes === 'number'
+        && minFreeGb > 0
+        && data.free_bytes < minFreeGb * BYTES_PER_GB;
+    const anyQuota = (settings.global_quota_gb || 0) > 0
+        || channels.some(channel => channel.quota_overridden);
+    const anyRetention = (settings.retention_days || 0) > 0
+        || channels.some(channel => channel.retention_overridden);
+    const anyOver = channels.some(channel => channel.over_quota);
+    const totals = data.totals || {};
+
+    const summary = document.getElementById('storageSummary');
+    if (summary) {
+        const parts = [`${formatGb(totals.used_bytes)} used`, `${formatGb(data.free_bytes)} free`];
+        if (lowFree) parts.push('⚠️ low space');
+        summary.textContent = parts.join(' · ');
+    }
+
+    // Stay hidden until something storage-related deserves attention
+    // (or the user expanded the panel manually).
+    if (!storagePanelExpanded && !anyQuota && !anyRetention && !lowFree && !anyOver) {
+        panel.style.display = 'none';
+        return;
+    }
+
+    panel.style.display = 'block';
+    const content = document.getElementById('storageContent');
+    content.style.display = storagePanelExpanded ? 'block' : 'none';
+    if (!storagePanelExpanded) return;
+
+    const list = document.createElement('div');
+    list.className = 'storage-list';
+    const globalQuota = settings.global_quota_gb || 0;
+    list.append(storageRow('Total media', totals.used_bytes || 0, globalQuota,
+        `${totals.episodes || 0} episodes · ${totals.pinned || 0} 📌`, anyOver).row);
+
+    const freeRow = document.createElement('div');
+    freeRow.className = 'storage-row' + (lowFree ? ' storage-warning' : '');
+    const freeLabel = document.createElement('span');
+    freeLabel.className = 'storage-label';
+    freeLabel.textContent = 'Free space';
+    const freeTrack = document.createElement('div');
+    freeTrack.className = 'storage-bar-track';
+    const freeText = document.createElement('span');
+    freeText.className = 'storage-text';
+    freeText.textContent = lowFree
+        ? `${formatGb(data.free_bytes)} — below ${minFreeGb} GB minimum`
+        : formatGb(data.free_bytes);
+    freeRow.append(freeLabel, freeTrack, freeText);
+    list.append(freeRow);
+
+    for (const channel of channels) {
+        if (!channel.quota_overridden) continue;
+        list.append(storageRow(
+            channel.display_name || channel.name,
+            channel.used_bytes,
+            channel.quota_gb,
+            `${channel.episodes} episodes · ${channel.pinned} 📌${channel.over_quota ? ' · over quota' : ''}`,
+            channel.over_quota,
+        ).row);
+    }
+    content.replaceChildren(list);
+}
+
+function toggleStoragePanel() {
+    storagePanelExpanded = !storagePanelExpanded;
+    const content = document.getElementById('storageContent');
+    const toggleBtn = document.querySelector('#storagePanel .logs-collapse');
+    if (content) content.style.display = storagePanelExpanded ? 'block' : 'none';
+    if (toggleBtn) toggleBtn.textContent = storagePanelExpanded ? '−' : '+';
+    if (storagePanelExpanded) refreshStoragePanel();
+}
+
 // Relative time formatting
 function formatRelativeTime(isoTimestamp) {
     try {
@@ -1258,6 +1479,8 @@ async function refreshSingleChannel(channelName, button) {
 document.addEventListener('DOMContentLoaded', function() {
     checkRefreshStatus();
     startQueuePolling();
+    refreshStoragePanel();
+    setInterval(refreshStoragePanel, 30000);
     updateRelativeTimes();
     
     // Update relative times every minute

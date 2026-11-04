@@ -22,7 +22,7 @@ class Element {
     }
 }
 
-function setup() {
+function setup(overrides = {}) {
     const elements = new Map();
     const episode = {
         id: '_video123',
@@ -31,6 +31,7 @@ function setup() {
         duration: '<svg onload=pwned()>',
         description: '<script>pwned()</script>',
         file_extension: '.webm',
+        ...overrides,
     };
     const context = vm.createContext({
         console,
@@ -49,6 +50,11 @@ function setup() {
     return { context, elements, episode };
 }
 
+function renderButtons(context, elements) {
+    const item = elements.get('episodesContent').children[0].children[0];
+    return item.children[1].children;
+}
+
 test('episode metadata is rendered as text', async () => {
     const { context, elements, episode } = setup();
     await context.openEpisodesModal('channel', 'Display Name');
@@ -61,21 +67,38 @@ test('episode metadata is rendered as text', async () => {
     assert.equal(context.pwned, undefined);
 });
 
-test('all five episode actions receive exact values and their button', async () => {
+test('all six episode actions receive exact values and their button', async () => {
     const { context, elements, episode } = setup();
     const calls = [];
-    for (const name of ['openEpisodeMedia', 'downloadAsMP3', 'downloadOriginalFile', 'redownloadEpisode', 'deleteEpisode']) {
+    for (const name of ['openEpisodeMedia', 'downloadAsMP3', 'downloadOriginalFile', 'redownloadEpisode', 'deleteEpisode', 'togglePin']) {
         context[name] = (...args) => calls.push({ name, args });
     }
     await context.openEpisodesModal('channel', 'Display Name');
-    const buttons = elements.get('episodesContent').children[0].children[0].children[1].children;
+    const buttons = renderButtons(context, elements);
+    assert.equal(buttons[5].textContent, '📌 Pin');
     buttons.forEach(button => button.listeners.click());
-    assert.equal(calls.length, 5);
+    assert.equal(calls.length, 6);
     calls.forEach((call, index) => {
         assert.equal(call.args[0], 'channel');
         assert.equal(call.args[1], episode.id);
-        assert.equal(call.args[2], index < 3 ? '.webm' : episode.title);
+        if (index < 3) assert.equal(call.args[2], '.webm');
+        else if (index < 5) assert.equal(call.args[2], episode.title);
+        else assert.equal(call.args[2], false);
         if (index > 0) assert.equal(call.args[3], buttons[index]);
     });
     assert.equal(context.pwned, undefined);
+});
+
+test('pinned episodes show a badge and offer unpinning', async () => {
+    const { context, elements } = setup({ pinned: true });
+    const toggles = [];
+    context.togglePin = (channel, id, pinned) => toggles.push(pinned);
+    await context.openEpisodesModal('channel', 'Display Name');
+    const item = elements.get('episodesContent').children[0].children[0];
+    const badge = item.children[0].children[0].children[2];
+    assert.equal(badge.textContent, '📌');
+    const buttons = renderButtons(context, elements);
+    assert.equal(buttons[5].textContent, '📍 Unpin');
+    buttons[5].listeners.click();
+    assert.deepEqual(toggles, [true]);
 });

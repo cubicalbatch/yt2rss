@@ -30,9 +30,23 @@ from pathlib import Path
 from typing import Any, Iterator
 
 try:
-    from .utils import MediaLock, atomic_write_text, cleanup_episodes
+    from .storage import (
+        admission_error,
+        apply_retention,
+        effective_channel_storage,
+        load_storage_settings,
+        pinned_ids,
+    )
+    from .utils import MediaLock, atomic_write_text, cleanup_episodes, contained_path
 except ImportError:
-    from utils import MediaLock, atomic_write_text, cleanup_episodes
+    from storage import (
+        admission_error,
+        apply_retention,
+        effective_channel_storage,
+        load_storage_settings,
+        pinned_ids,
+    )
+    from utils import MediaLock, atomic_write_text, cleanup_episodes, contained_path
 
 QUEUE_FILENAME = "download_queue.json"
 COMPLETED_HISTORY_LIMIT = 200
@@ -60,6 +74,7 @@ _JOB_DEFAULTS: dict[str, Any] = {
     "error": None,
     "progress": None,
     "cancel_requested": False,
+    "estimated_bytes": None,
 }
 
 
@@ -69,6 +84,10 @@ class DownloadCancelled(Exception):
 
 class ChannelMissingError(Exception):
     """Raised when a queued job's channel is no longer configured."""
+
+
+class StorageLimitError(RuntimeError):
+    """Raised when a download is blocked by quota or free-space limits."""
 
 
 def backoff_delay_seconds(attempt: int) -> float:
@@ -94,6 +113,7 @@ def _new_job(
     title: str,
     url: str,
     snapshot: dict[str, Any] | None,
+    estimated_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Build a job record with the full persistent schema."""
     return {
@@ -113,6 +133,7 @@ def _new_job(
         "error": None,
         "progress": None,
         "cancel_requested": False,
+        "estimated_bytes": estimated_bytes,
     }
 
 
@@ -197,6 +218,7 @@ class DownloadQueue:
         title: str,
         url: str,
         snapshot: dict[str, Any] | None = None,
+        estimated_bytes: int | None = None,
     ) -> dict[str, Any] | None:
         """Add a download job unless an active one already covers it.
 
@@ -206,6 +228,7 @@ class DownloadQueue:
             title: Human-readable video title for the UI.
             url: Watch URL used by the downloader.
             snapshot: Channel settings captured at enqueue time.
+            estimated_bytes: Worst-case size estimate used by quota checks.
 
         Returns:
             The created job, or None when an active job for the same
@@ -220,7 +243,7 @@ class DownloadQueue:
                     and job.get("video_id") == video_id
                 ):
                     return None
-            job = _new_job(channel, video_id, title, url, snapshot)
+            job = _new_job(channel, video_id, title, url, snapshot, estimated_bytes)
             job_list.append(job)
             return deepcopy(job)
 
@@ -316,6 +339,37 @@ class DownloadQueue:
                     next_attempt_at=time.time() + backoff_delay_seconds(attempts),
                 )
             job.update(updates)
+            return deepcopy(job)
+
+        return self._mutate(mutate, {})
+
+    def mark_failed_terminal(self, job_id: str, error: str) -> dict[str, Any] | None:
+        """Retire a running job as failed immediately, with no retry attempt.
+
+        Used for deterministic blockers such as storage quota limits: the
+        job lands in the terminal ``failed`` state with an actionable
+        message and can be retried manually once the blocker is resolved.
+
+        Args:
+            job_id: Identifier of the running job.
+            error: Human-readable, actionable description of the blocker.
+
+        Returns:
+            The updated job, or None when the job is unknown or not running.
+        """
+
+        def mutate(job_list: list[dict[str, Any]]) -> dict[str, Any] | None:
+            job = self._find(job_list, job_id)
+            if job is None or job.get("state") != "running":
+                return None
+            job.update(
+                state="failed",
+                finished_at=_utc_now_iso(),
+                error=error,
+                progress=None,
+                cancel_requested=False,
+            )
+            self._forget_memory_flag(job_id)
             return deepcopy(job)
 
         return self._mutate(mutate, {})
@@ -516,6 +570,14 @@ class DownloadQueue:
         normalized["attempts"] = max(0, int(normalized["attempts"]))
         normalized["max_attempts"] = max(1, int(normalized["max_attempts"]))
         normalized["cancel_requested"] = bool(normalized["cancel_requested"])
+        estimate = normalized.get("estimated_bytes")
+        normalized["estimated_bytes"] = (
+            int(estimate)
+            if isinstance(estimate, int)
+            and not isinstance(estimate, bool)
+            and estimate > 0
+            else None
+        )
         # Copy the snapshot: the defaults dict must never be shared.
         snapshot = normalized["config_snapshot"]
         normalized["config_snapshot"] = (
@@ -647,6 +709,8 @@ def execute_queue_job(
     Raises:
         DownloadCancelled: When ``cancel_check`` reports a cancellation.
         ChannelMissingError: When the channel is no longer configured.
+        StorageLimitError: When quota or free-space protection blocks the
+            download; the worker retires such jobs as terminal failures.
         RuntimeError: When the download failed.
     """
     queue_logger = logger if logger is not None else logging.getLogger(__name__)
@@ -659,7 +723,7 @@ def execute_queue_job(
     if log_handler is not None:
         downloader.logger.addHandler(log_handler)
     try:
-        channels, _global_config = downloader.load_config()
+        channels, global_config = downloader.load_config()
         channel_name = job["channel"]
         channel = next(
             (entry for entry in channels if entry.get("name") == channel_name),
@@ -683,6 +747,13 @@ def execute_queue_job(
                 f"⏭️  {job['video_id']} already downloaded; marking complete"
             )
         else:
+            _check_storage_admission(
+                job,
+                channel=channel,
+                videos_dir=videos_dir,
+                global_config=global_config,
+                format_type=format_type,
+            )
 
             def progress_hook(d: dict[str, Any]) -> None:
                 """Cooperatively abort and report progress from yt-dlp."""
@@ -710,10 +781,79 @@ def execute_queue_job(
                 )
 
         downloader.rss_generator.update_channel_refresh_time(channel_name)
-        cleanup_episodes(videos_dir, channel_name, max_episodes)
+        cleanup_episodes(
+            videos_dir,
+            channel_name,
+            max_episodes,
+            pinned=pinned_ids(config_path.parent, channel_name),
+        )
+        _apply_job_retention(
+            channel=channel,
+            videos_dir=videos_dir,
+            config_path=config_path,
+            global_config=global_config,
+            logger=queue_logger,
+        )
     finally:
         if log_handler is not None:
             downloader.logger.removeHandler(log_handler)
+
+
+def _job_estimate_bytes(job: dict[str, Any]) -> int | None:
+    """Return the job's persisted size estimate when it is usable."""
+    estimate = job.get("estimated_bytes")
+    if isinstance(estimate, int) and not isinstance(estimate, bool) and estimate > 0:
+        return estimate
+    return None
+
+
+def _check_storage_admission(
+    job: dict[str, Any],
+    *,
+    channel: dict[str, Any],
+    videos_dir: Path,
+    global_config: dict[str, Any],
+    format_type: str,
+) -> None:
+    """Raise :class:`StorageLimitError` when quota or free space blocks the job."""
+    settings = load_storage_settings(global_config)
+    blocked = admission_error(
+        settings=settings,
+        channel=channel,
+        channel_dir=contained_path(videos_dir, job["channel"]),
+        videos_dir=videos_dir,
+        format_type=format_type,
+        estimate_bytes=_job_estimate_bytes(job),
+    )
+    if blocked is not None:
+        raise StorageLimitError(blocked)
+
+
+def _apply_job_retention(
+    *,
+    channel: dict[str, Any],
+    videos_dir: Path,
+    config_path: Path,
+    global_config: dict[str, Any],
+    logger: logging.Logger,
+) -> int:
+    """Apply the channel's effective retention after its download completed."""
+    effective = effective_channel_storage(load_storage_settings(global_config), channel)
+    if effective["retention_days"] <= 0:
+        return 0
+    pinned = pinned_ids(config_path.parent, channel["name"])
+    removed = apply_retention(
+        videos_dir,
+        channel["name"],
+        effective["retention_days"],
+        pinned=pinned,
+        logger=logger,
+    )
+    if removed:
+        logger.info(
+            f"🗑️  Retention removed {removed} old episode(s) from {channel['name']}"
+        )
+    return removed
 
 
 class QueueWorker:
@@ -847,6 +987,9 @@ class QueueWorker:
         except ChannelMissingError as missing:
             self.logger.warning(f"Channel removed; cancelling job: {missing}")
             self.queue.mark_cancelled(job_id, error=str(missing))
+        except StorageLimitError as limit:
+            self.logger.warning(f"Storage limit blocked job ({job_id}): {limit}")
+            self.queue.mark_failed_terminal(job_id, error=str(limit))
         except Exception as error:
             self.logger.error(f"Download job failed ({job_id}): {error}")
             self.queue.mark_failed(job_id, str(error))
