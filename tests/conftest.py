@@ -2,11 +2,15 @@
 Shared pytest configuration and fixtures.
 """
 
+import builtins
+import errno
 import os
 import shutil
 import sys
 import tempfile
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -58,3 +62,29 @@ def mock_atexit():
     """Mock atexit.register to avoid cleanup issues during tests."""
     with patch("atexit.register") as mock_exit:
         yield mock_exit
+
+
+@pytest.fixture
+def unreadable_files() -> Iterator[Callable[[Path], None]]:
+    """Make reads of registered paths fail with ``PermissionError``.
+
+    Only builtin ``open`` calls on exactly those paths fail; every other
+    file (and ``Path.read_bytes`` used by assertions) works normally, in
+    every thread. Unlike ``chmod`` this also works when tests run as root.
+
+    Yields:
+        A callable registering one path whose reads must fail.
+    """
+    blocked: set[str] = set()
+    real_open = builtins.open
+
+    def guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(file, (str, os.PathLike)) and os.path.abspath(file) in blocked:
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(file))
+        return real_open(file, *args, **kwargs)
+
+    def block(path: Path) -> None:
+        blocked.add(os.path.abspath(path))
+
+    with patch("builtins.open", guarded_open):
+        yield block

@@ -28,6 +28,10 @@ flood the target.
 
 Notifications are opt-in: without ``notifications.webhook_url`` in
 ``channels.yaml`` events are recorded but nothing leaves the process.
+
+A corrupt ``health.json`` is quarantined and reads as empty. An unreadable
+one is never treated as empty data: readers degrade to an empty view with
+a log, and writers skip saving so the file is never overwritten.
 """
 
 import json
@@ -41,9 +45,19 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 try:
-    from .utils import atomic_write_text
+    from .utils import (
+        StateFileError,
+        atomic_write_text,
+        read_json_state,
+        require_json_object,
+    )
 except ImportError:
-    from utils import atomic_write_text
+    from utils import (
+        StateFileError,
+        atomic_write_text,
+        read_json_state,
+        require_json_object,
+    )
 
 HEALTH_FILENAME = "health.json"
 HISTORY_LIMIT = 50
@@ -79,22 +93,32 @@ def _empty_state() -> dict[str, Any]:
     }
 
 
-def load_health(config_dir: str | Path) -> dict[str, Any]:
-    """Load health data; a corrupt file is quarantined and reads as empty."""
-    path = health_path(config_dir)
-    if not path.is_file():
-        return {"channels": {}, "notifications": {}}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("health file must be an object")
-    except (OSError, json.JSONDecodeError, ValueError) as error:
-        logging.error(f"Health file is corrupt ({error}); starting empty")
-        try:
-            path.replace(Path(f"{path}.corrupt"))
-        except OSError as backup_error:
-            logging.error(f"Could not back up corrupt health file: {backup_error}")
-        return {"channels": {}, "notifications": {}}
+def _empty_health() -> dict[str, Any]:
+    """Return the health data of a fresh installation."""
+    return {"channels": {}, "notifications": {}}
+
+
+def load_health(config_dir: str | Path, *, quarantine: bool = True) -> dict[str, Any]:
+    """Load health data; a corrupt file is quarantined and reads as empty.
+
+    Args:
+        config_dir: Directory holding ``health.json``.
+        quarantine: Move a corrupt file aside; lock-free readers pass
+            False and leave that to the locked writers.
+
+    Returns:
+        ``{"channels": ..., "notifications": ...}`` with invalid entries
+        dropped.
+
+    Raises:
+        StateFileError: When the file exists but cannot be read; it is
+            left untouched.
+    """
+    data = read_json_state(
+        health_path(config_dir), validate=require_json_object, quarantine=quarantine
+    )
+    if data is None:
+        return _empty_health()
 
     channels = data.get("channels")
     if not isinstance(channels, dict):
@@ -147,6 +171,35 @@ def load_health(config_dir: str | Path) -> dict[str, Any]:
     return {"channels": cleaned_channels, "notifications": cleaned_notifications}
 
 
+def _read_health_view(config_dir: str | Path) -> dict[str, Any]:
+    """Read health lock-free for display or evaluation.
+
+    Never quarantines; an unreadable file degrades to empty data (logged)
+    so health views keep working while the file itself stays untouched.
+    """
+    try:
+        return load_health(config_dir, quarantine=False)
+    except StateFileError as error:
+        logging.error(f"Health data unavailable: {error}")
+        return _empty_health()
+
+
+def _load_health_for_update(
+    config_dir: str | Path, action: str
+) -> dict[str, Any] | None:
+    """Load health before a write; None (logged) means skip the save.
+
+    Args:
+        config_dir: Directory holding ``health.json``.
+        action: Description of the skipped update for the log.
+    """
+    try:
+        return load_health(config_dir)
+    except StateFileError as error:
+        logging.error(f"Not saving health data ({action}): {error}")
+        return None
+
+
 def save_health(config_dir: str | Path, data: dict[str, Any]) -> bool:
     """Persist health data atomically; return False when the write failed."""
     try:
@@ -188,7 +241,8 @@ def record_refresh(
         at: ISO timestamp override (tests).
 
     Returns:
-        The updated per-channel state.
+        The updated per-channel state. When ``health.json`` cannot be
+        read nothing is saved and the state reflects this refresh only.
     """
     timestamp = at or datetime.now(UTC).isoformat()
     entry: dict[str, Any] = {
@@ -203,36 +257,61 @@ def record_refresh(
         entry["error"] = str(error)
 
     with _health_lock:
-        data = load_health(config_dir)
-        channels = data["channels"]
-        state = channels.get(channel_name) or _empty_state()
-        if success:
-            state["consecutive_failures"] = 0
-            state["last_success_at"] = timestamp
-            state["last_error"] = None
-            state["unavailable"] = False
-        else:
-            state["consecutive_failures"] = (
-                _non_negative_int(state.get("consecutive_failures")) + 1
-            )
-            state["last_failure_at"] = timestamp
-            state["last_error"] = error or "Unknown error"
-            state["unavailable"] = bool(unavailable)
-        history = state.get("history")
-        if not isinstance(history, list):
-            history = []
-        history.append(entry)
-        state["history"] = history[-HISTORY_LIMIT:]
-        channels[channel_name] = state
-        save_health(config_dir, data)
+        data = _load_health_for_update(config_dir, f"refresh of {channel_name}")
+        channels = data["channels"] if data is not None else {}
+        state = _apply_refresh(
+            channels.get(channel_name) or _empty_state(), entry, error=error
+        )
+        if data is not None:
+            channels[channel_name] = state
+            save_health(config_dir, data)
         return dict(state)
 
 
+def _apply_refresh(
+    state: dict[str, Any], entry: dict[str, Any], *, error: str | None
+) -> dict[str, Any]:
+    """Update a channel state in place with one refresh history entry.
+
+    Args:
+        state: The channel's current health state.
+        entry: History entry built by :func:`record_refresh`.
+        error: Failure description; ignored on success.
+
+    Returns:
+        The updated ``state``.
+    """
+    timestamp = entry["at"]
+    if entry["status"] == "success":
+        state["consecutive_failures"] = 0
+        state["last_success_at"] = timestamp
+        state["last_error"] = None
+        state["unavailable"] = False
+    else:
+        state["consecutive_failures"] = (
+            _non_negative_int(state.get("consecutive_failures")) + 1
+        )
+        state["last_failure_at"] = timestamp
+        state["last_error"] = error or "Unknown error"
+        state["unavailable"] = entry["unavailable"]
+    history = state.get("history")
+    if not isinstance(history, list):
+        history = []
+    history.append(entry)
+    state["history"] = history[-HISTORY_LIMIT:]
+    return state
+
+
 def remove_channel_health(config_dir: str | Path, channel_name: str) -> bool:
-    """Forget one channel's health state (used when the channel is deleted)."""
+    """Forget one channel's health state (used when the channel is deleted).
+
+    Returns:
+        True when the state was removed; False when there was none or
+        ``health.json`` could not be read (it is then left untouched).
+    """
     with _health_lock:
-        data = load_health(config_dir)
-        if channel_name not in data["channels"]:
+        data = _load_health_for_update(config_dir, f"removal of {channel_name}")
+        if data is None or channel_name not in data["channels"]:
             return False
         del data["channels"][channel_name]
         save_health(config_dir, data)
@@ -354,7 +433,7 @@ def collect_events(
         "occurred_at", ...}`` ready for :func:`dispatch_events`.
     """
     current = now or datetime.now(UTC)
-    data = load_health(config_dir)
+    data = _read_health_view(config_dir)
     last_sent = data["notifications"].get("last_sent", {})
     cooldown = int(settings.get("cooldown_minutes", DEFAULT_COOLDOWN_MINUTES))
     threshold = int(settings.get("failure_threshold", DEFAULT_FAILURE_THRESHOLD))
@@ -500,7 +579,9 @@ def dispatch_events(
         results.append(result)
 
     with _health_lock:
-        data = load_health(config_dir)
+        data = _load_health_for_update(config_dir, "notification bookkeeping")
+        if data is None:
+            return results
         notifications = data["notifications"]
         for event, result in attempts:
             key = str(event.get("key") or "")
@@ -520,8 +601,12 @@ def dispatch_events(
 
 
 def health_summary(config_dir: str | Path) -> dict[str, Any]:
-    """Return the stored channel states and notification bookkeeping."""
-    data = load_health(config_dir)
+    """Return the stored channel states and notification bookkeeping.
+
+    Never quarantines and never raises for an unreadable file: the summary
+    is then empty and the error is logged.
+    """
+    data = _read_health_view(config_dir)
     return {
         "channels": data.get("channels", {}),
         "notifications": data.get("notifications", {}),

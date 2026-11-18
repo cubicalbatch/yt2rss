@@ -168,7 +168,11 @@ single worker thread downloads them one at a time:
 - Jobs survive restarts: a queue file is written atomically after every
   change, jobs left `running` by a crash are requeued on startup, and a
   corrupt queue file is quarantined as `download_queue.json.corrupt` while
-  the app starts with an empty queue.
+  the app starts with an empty queue. Later corruptions get a timestamped
+  backup name, so earlier backups are never overwritten. A queue file that
+  cannot be read (permissions, I/O errors) is never discarded: the queue
+  reads as empty and every change is refused until the file is readable
+  again.
 - Failed downloads retry automatically up to 5 attempts with a
   deterministic exponential backoff (60s, 120s, 240s, 480s between
   attempts); exhausted attempts stay `failed` with the last error until
@@ -240,7 +244,11 @@ How enforcement works:
   `max_episodes` cleanup.
 - **Pins** are stored in `appdata/config/pins.json` and survive episode
   redownloads and metadata rewrites. They are removed only when the
-  episode (delete) or its channel (purge/delete) is removed.
+  episode (delete) or its channel (purge/delete) is removed. A corrupt or
+  unreadable `pins.json` is never treated as "nothing pinned" and never
+  moved aside automatically: `max_episodes` cleanup and retention pause
+  (with an error in the log), pin changes are refused, and the storage
+  view reports `pins_error` until you repair or remove the file.
 
 Storage API (session-authenticated when `YT2RSS_PASSWORD` is set):
 
@@ -267,7 +275,13 @@ title}}}`) so refreshes never download it again:
   queue execution cancels a queued job for a tombstoned video instead of
   downloading it. The RSS feed and episode counts never include them.
 - A corrupt `tombstones.json` is quarantined as `tombstones.json.corrupt`
-  and the app starts with an empty set — deletions are lost, not crashes.
+  (later corruptions get a timestamped name, so backups are never
+  overwritten) and the app starts with an empty set — deletions are lost,
+  not crashes. A file that cannot be read is never discarded: refreshes
+  fail (recorded in the refresh health) and queued downloads retry instead
+  of fetching possibly deleted episodes, deleting episodes and the
+  tombstone endpoints return an error, while feeds and episode lists keep
+  working.
 - An **explicit redownload** of a remembered-deleted episode is allowed
   and clears its tombstone on success, making it a normal episode again.
 - **Purge is an explicit reset**: it clears the channel's tombstones, so a
@@ -335,8 +349,12 @@ Health API (session-authenticated when `YT2RSS_PASSWORD` is set):
 | `/api/config/notifications` | GET/PUT | Read or validate and save notification settings |
 | `/api/notifications/test` | POST | Deliver a test event to the configured webhook |
 
-A corrupt `health.json` is quarantined as `health.json.corrupt` and the app
-starts with empty history. Deleting a channel removes its health state.
+A corrupt `health.json` is quarantined as `health.json.corrupt` (later
+corruptions get a timestamped name, so backups are never overwritten) and
+the app starts with empty history. A `health.json` that cannot be read is
+never discarded: health views and scheduling treat it as empty and new
+refresh results are not saved until it is readable again. Deleting a
+channel removes its health state.
 
 ### SponsorBlock Categories
 

@@ -315,6 +315,55 @@ class TestQueueStore:
         assert backup.exists()
         assert "not json" in backup.read_text()
 
+    def test_lock_free_reads_never_quarantine_corrupt_file(self, queue, config_dir):
+        job = enqueue_job(queue)
+        queue_file = config_dir / "download_queue.json"
+        queue_file.write_text("{not json at all")
+        assert queue.jobs() == []
+        assert queue.get(job["id"]) is None
+        assert queue.peek_due() is None
+        assert queue.counts()["pending"] == 0
+        assert queue_file.read_text() == "{not json at all"
+        assert not (config_dir / "download_queue.json.corrupt").exists()
+        # The next locked mutation quarantines it and starts fresh.
+        enqueue_job(queue, video_id="fresh")
+        backup = config_dir / "download_queue.json.corrupt"
+        assert backup.read_text() == "{not json at all"
+        assert [item["video_id"] for item in queue.jobs()] == ["fresh"]
+
+    def test_unreadable_file_is_never_overwritten(
+        self, queue, config_dir, unreadable_files
+    ):
+        pending = enqueue_job(queue, video_id="pending")
+        running = enqueue_job(queue, video_id="running")
+        queue.claim_next()
+        queue_file = config_dir / "download_queue.json"
+        original = queue_file.read_bytes()
+        unreadable_files(queue_file)
+
+        assert queue.jobs() == []
+        assert queue.enqueue(channel="c", video_id="v", title="t", url="u") is None
+        assert queue.claim_next() is None
+        assert queue.request_cancel(pending["id"]) is None
+        assert queue.mark_failed(running["id"], "boom") is None
+        assert queue.clear_completed() == 0
+        assert queue.recover_interrupted() == 0
+        assert queue.requeue_running(running["id"]) is False
+        DownloadQueue(config_dir)  # Startup recovery must not reset it either.
+
+        assert queue_file.read_bytes() == original
+        assert list(config_dir.glob("download_queue.json.corrupt*")) == []
+
+    def test_drain_with_unreadable_file_processes_nothing(
+        self, queue, config_dir, unreadable_files
+    ):
+        enqueue_job(queue)
+        unreadable_files(config_dir / "download_queue.json")
+        executor = Mock()
+        worker = QueueWorker(queue, executor=executor, media_lock=None)
+        assert worker.run_pending() == 0
+        executor.assert_not_called()
+
     def test_invalid_entries_are_dropped_not_fatal(self, queue, config_dir):
         good = enqueue_job(queue)
         queue_file = config_dir / "download_queue.json"

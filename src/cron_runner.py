@@ -29,7 +29,7 @@ try:
     from .storage import (
         free_disk_bytes,
         load_storage_settings,
-        pinned_ids,
+        pins_for_deletion,
     )
     from .utils import cleanup_episodes, safe_component, validate_channel_settings
 except ImportError:
@@ -42,7 +42,7 @@ except ImportError:
         load_notification_settings,
         record_refresh,
     )
-    from storage import free_disk_bytes, load_storage_settings, pinned_ids
+    from storage import free_disk_bytes, load_storage_settings, pins_for_deletion
     from utils import cleanup_episodes, safe_component, validate_channel_settings
 
 
@@ -210,15 +210,19 @@ class AutomationRunner:
 
         return True
 
-    def cleanup_old_videos(self, channel_name: str, max_episodes: int):
-        """Remove completed media files exceeding the configured limit."""
+    def cleanup_old_videos(self, channel_name: str, max_episodes: int) -> None:
+        """Remove completed media files exceeding the configured limit.
+
+        Skipped (with an actionable error) while ``pins.json`` is unusable,
+        so pinned episodes are never deleted by mistake.
+        """
+        pinned = pins_for_deletion(
+            self.config_path.parent, channel_name, self.logger, "cleanup"
+        )
+        if pinned is None:
+            return
         try:
-            cleanup_episodes(
-                self.videos_dir,
-                channel_name,
-                max_episodes,
-                pinned=pinned_ids(self.config_path.parent, channel_name),
-            )
+            cleanup_episodes(self.videos_dir, channel_name, max_episodes, pinned=pinned)
         except Exception as error:
             self.logger.error(f"Error cleaning up {channel_name}: {error}")
 

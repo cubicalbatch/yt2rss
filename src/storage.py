@@ -8,13 +8,19 @@ traversed.
 
 Pins live in ``config_dir/pins.json`` as ``{"<channel>": ["<video_id>", ...]}``
 so they survive episode metadata rewrites and redownloads; they are removed
-only when the episode or its channel is deleted.
+only when the episode or its channel is deleted. Pins guard irreversible
+deletions, so a corrupt or unreadable ``pins.json`` fails closed: it raises
+:class:`PinsUnavailableError`, cleanup and retention pause, and the file is
+never quarantined or overwritten automatically.
 
 Tombstones live in ``config_dir/tombstones.json`` as
 ``{"<channel>": {"<video_id>": {"deleted_at": ..., "title": ...}}}`` and
 remember manually deleted episodes so discovery, queue execution, the RSS
 feed and the episodes API never bring them back. An explicit channel purge
-(forget via the API) or channel deletion clears them.
+(forget via the API) or channel deletion clears them. A corrupt file is
+quarantined and reads as empty; an unreadable one raises
+:class:`~utils.StateFileError` so callers fail closed instead of
+forgetting every deletion.
 """
 
 import json
@@ -35,9 +41,14 @@ try:
         MAX_QUOTA_GB,
         MAX_RETENTION_DAYS,
         MEDIA_EXTENSIONS,
+        CorruptStateFileError,
+        StateFileError,
         atomic_write_text,
         contained_path,
         load_json_file,
+        read_json_state,
+        read_json_state_strict,
+        require_json_object,
         safe_component,
         validate_bounded_number,
         validate_channel_settings,
@@ -48,9 +59,14 @@ except ImportError:
         MAX_QUOTA_GB,
         MAX_RETENTION_DAYS,
         MEDIA_EXTENSIONS,
+        CorruptStateFileError,
+        StateFileError,
         atomic_write_text,
         contained_path,
         load_json_file,
+        read_json_state,
+        read_json_state_strict,
+        require_json_object,
         safe_component,
         validate_bounded_number,
         validate_channel_settings,
@@ -368,18 +384,60 @@ def pins_path(config_dir: str | Path) -> Path:
     return Path(config_dir) / PINS_FILENAME
 
 
+class PinsUnavailableError(RuntimeError):
+    """Raised when ``pins.json`` exists but is unreadable or corrupt.
+
+    Treating such a file as "nothing pinned" would let cleanup and
+    retention delete pinned episodes irreversibly, so callers must skip
+    every destructive pass and never write pins until it is repaired.
+    """
+
+
+def _validate_pins(data: Any) -> None:
+    """Require ``{channel: [video_id, ...]}``; anything else is corrupt.
+
+    Raises:
+        ValueError: When the top level is not an object or a channel's
+            pins are not a list.
+    """
+    require_json_object(data)
+    for channel, ids in data.items():
+        if not isinstance(ids, list):
+            raise ValueError(f"pins for channel '{channel}' must be a list")
+
+
 def load_pins(config_dir: str | Path) -> dict[str, list[str]]:
-    """Load pinned episode ids per channel; malformed data reads as empty."""
-    path = pins_path(config_dir)
-    if not path.is_file():
+    """Load pinned episode ids per channel.
+
+    A missing file means nothing is pinned. A corrupt or unreadable file
+    is never read as empty and never quarantined automatically.
+
+    Raises:
+        PinsUnavailableError: When ``pins.json`` exists but cannot be read
+            or holds invalid content.
+    """
+    try:
+        data = read_json_state_strict(pins_path(config_dir), validate=_validate_pins)
+    except (StateFileError, CorruptStateFileError) as error:
+        raise PinsUnavailableError(
+            f"{error}. Episode cleanup and retention are paused and pins "
+            f"cannot change until {PINS_FILENAME} is repaired or removed"
+        ) from error
+    if data is None:
         return {}
-    data = load_json_file(str(path))
-    pins: dict[str, list[str]] = {}
-    if isinstance(data, dict):
-        for channel, ids in data.items():
-            if isinstance(ids, list):
-                pins[str(channel)] = [entry for entry in ids if isinstance(entry, str)]
-    return pins
+    return {
+        str(channel): [entry for entry in ids if isinstance(entry, str)]
+        for channel, ids in data.items()
+    }
+
+
+def _load_pins_for_update(config_dir: str | Path) -> dict[str, list[str]] | None:
+    """Load pins before a write; None (logged) means the write must not happen."""
+    try:
+        return load_pins(config_dir)
+    except PinsUnavailableError as error:
+        logging.error(f"Not changing pins: {error}")
+        return None
 
 
 def save_pins(config_dir: str | Path, pins: dict[str, list[str]]) -> bool:
@@ -395,16 +453,55 @@ def save_pins(config_dir: str | Path, pins: dict[str, list[str]]) -> bool:
 
 
 def pinned_ids(config_dir: str | Path, channel_name: str) -> set[str]:
-    """Return the set of pinned video ids for one channel."""
+    """Return the set of pinned video ids for one channel.
+
+    Raises:
+        PinsUnavailableError: When ``pins.json`` is unreadable or corrupt.
+    """
     return set(load_pins(config_dir).get(channel_name, ()))
+
+
+def pins_for_deletion(
+    config_dir: str | Path,
+    channel_name: str,
+    logger: logging.Logger,
+    action: str,
+) -> set[str] | None:
+    """Return a channel's pins for a destructive pass, or None to skip it.
+
+    Deleting without knowing the pins could remove pinned episodes
+    irreversibly, so an unusable ``pins.json`` pauses the pass and logs an
+    actionable error instead.
+
+    Args:
+        config_dir: Directory holding ``pins.json``.
+        channel_name: Sanitized channel identifier.
+        logger: Logger receiving the error.
+        action: Name of the skipped pass, e.g. ``"retention"``.
+
+    Returns:
+        The pinned video ids, or None when the pass must be skipped.
+    """
+    try:
+        return pinned_ids(config_dir, channel_name)
+    except PinsUnavailableError as error:
+        logger.error(f"Skipping {action} for {channel_name}: {error}")
+        return None
 
 
 def set_episode_pinned(
     config_dir: str | Path, channel_name: str, video_id: str, pinned: bool
 ) -> bool:
-    """Add or remove one pin; returns False only when persistence failed."""
+    """Add or remove one pin.
+
+    Returns:
+        False when ``pins.json`` could not be read (it is then left
+        untouched) or the write failed.
+    """
     with _pins_lock:
-        pins = load_pins(config_dir)
+        pins = _load_pins_for_update(config_dir)
+        if pins is None:
+            return False
         ids = pins.setdefault(channel_name, [])
         if pinned and video_id not in ids:
             ids.append(video_id)
@@ -417,26 +514,41 @@ def set_episode_pinned(
 
 def remove_episode_pin(
     config_dir: str | Path, channel_name: str, video_id: str
-) -> None:
-    """Drop one pin, e.g. after the episode was deleted."""
+) -> bool:
+    """Drop one pin, e.g. after the episode was deleted.
+
+    Returns:
+        True when a pin was removed and persisted; False when there was
+        none, ``pins.json`` could not be read (left untouched) or the
+        write failed.
+    """
     with _pins_lock:
-        pins = load_pins(config_dir)
+        pins = _load_pins_for_update(config_dir)
+        if pins is None:
+            return False
         ids = pins.get(channel_name)
         if ids is None or video_id not in ids:
-            return
+            return False
         ids.remove(video_id)
         if not ids:
             pins.pop(channel_name, None)
-        save_pins(config_dir, pins)
+        return save_pins(config_dir, pins)
 
 
-def remove_channel_pins(config_dir: str | Path, channel_name: str) -> None:
-    """Drop every pin for a channel (purge or channel deletion)."""
+def remove_channel_pins(config_dir: str | Path, channel_name: str) -> bool:
+    """Drop every pin for a channel (purge or channel deletion).
+
+    Returns:
+        True when pins were removed and persisted; False when there were
+        none, ``pins.json`` could not be read (left untouched) or the
+        write failed.
+    """
     with _pins_lock:
-        pins = load_pins(config_dir)
-        if channel_name in pins:
-            del pins[channel_name]
-            save_pins(config_dir, pins)
+        pins = _load_pins_for_update(config_dir)
+        if pins is None or channel_name not in pins:
+            return False
+        del pins[channel_name]
+        return save_pins(config_dir, pins)
 
 
 # ---------- tombstones ----------
@@ -451,31 +563,33 @@ def tombstones_path(config_dir: str | Path) -> Path:
     return Path(config_dir) / TOMBSTONES_FILENAME
 
 
-def load_tombstones(config_dir: str | Path) -> dict[str, dict[str, dict[str, str]]]:
+def load_tombstones(
+    config_dir: str | Path, *, quarantine: bool = True
+) -> dict[str, dict[str, dict[str, str]]]:
     """Load remembered deletions per channel; corrupt data reads as empty.
 
-    A corrupt file is backed up as ``tombstones.json.corrupt`` so the
-    original bytes are never lost; loading must never crash the server.
+    A corrupt file is backed up as ``tombstones.json.corrupt`` (later
+    backups get a timestamp suffix) so the original bytes are never lost.
+
+    Args:
+        config_dir: Directory holding ``tombstones.json``.
+        quarantine: Move a corrupt file aside; lock-free readers pass
+            False and leave that to the locked writers.
 
     Returns:
         ``{channel: {video_id: {"deleted_at": iso, "title": str}}}`` with
         invalid entries dropped.
+
+    Raises:
+        StateFileError: When the file exists but cannot be read; it is
+            left untouched.
     """
-    path = tombstones_path(config_dir)
-    if not path.is_file():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("tombstones file must be an object")
-    except (OSError, json.JSONDecodeError, ValueError) as error:
-        logging.error(f"Tombstones file is corrupt ({error}); starting empty")
-        backup = Path(f"{path}.corrupt")
-        try:
-            path.replace(backup)
-            logging.info(f"Kept corrupt tombstones file as {backup.name}")
-        except OSError as backup_error:
-            logging.error(f"Could not back up corrupt tombstones file: {backup_error}")
+    data = read_json_state(
+        tombstones_path(config_dir),
+        validate=require_json_object,
+        quarantine=quarantine,
+    )
+    if data is None:
         return {}
     tombstones: dict[str, dict[str, dict[str, str]]] = {}
     for channel, entries in data.items():
@@ -508,9 +622,27 @@ def save_tombstones(
         return False
 
 
+def _load_tombstones_for_update(
+    config_dir: str | Path,
+) -> dict[str, dict[str, dict[str, str]]] | None:
+    """Load tombstones before a write; None (logged) means do not write."""
+    try:
+        return load_tombstones(config_dir)
+    except StateFileError as error:
+        logging.error(f"Not changing tombstones: {error}")
+        return None
+
+
 def tombstoned_ids(config_dir: str | Path, channel_name: str) -> set[str]:
-    """Return the set of remembered-deleted video ids for one channel."""
-    return set(load_tombstones(config_dir).get(channel_name, ()))
+    """Return the set of remembered-deleted video ids for one channel.
+
+    This lock-free read never quarantines a corrupt file.
+
+    Raises:
+        StateFileError: When ``tombstones.json`` cannot be read. Callers
+            deciding what to download must fail closed on it.
+    """
+    return set(load_tombstones(config_dir, quarantine=False).get(channel_name, ()))
 
 
 def record_tombstone(
@@ -530,10 +662,13 @@ def record_tombstone(
         deleted_at: ISO-8601 deletion time; defaults to now (UTC).
 
     Returns:
-        False only when persistence failed.
+        False when ``tombstones.json`` could not be read (it is then left
+        untouched) or the write failed.
     """
     with _tombstones_lock:
-        tombstones = load_tombstones(config_dir)
+        tombstones = _load_tombstones_for_update(config_dir)
+        if tombstones is None:
+            return False
         tombstones.setdefault(channel_name, {})[video_id] = {
             "deleted_at": deleted_at or datetime.now(UTC).isoformat(),
             "title": str(title or video_id),
@@ -547,35 +682,36 @@ def remove_episode_tombstone(
     """Forget one deletion, e.g. after an explicit redownload succeeded.
 
     Returns:
-        True when a tombstone record was removed.
+        True when a tombstone record was removed and persisted; False when
+        there was none, the file could not be read (left untouched) or the
+        write failed.
     """
     with _tombstones_lock:
-        tombstones = load_tombstones(config_dir)
+        tombstones = _load_tombstones_for_update(config_dir)
+        if tombstones is None:
+            return False
         channel = tombstones.get(channel_name)
         if not channel or video_id not in channel:
             return False
         del channel[video_id]
         if not channel:
             tombstones.pop(channel_name, None)
-        save_tombstones(config_dir, tombstones)
-        return True
+        return save_tombstones(config_dir, tombstones)
 
 
 def remove_channel_tombstones(config_dir: str | Path, channel_name: str) -> int:
     """Drop every tombstone for a channel; return how many were removed.
 
     Used by an explicit purge (a reset: deleted episodes may be downloaded
-    again) and by channel deletion.
+    again) and by channel deletion. Returns 0 without writing when the
+    file could not be read, and 0 when the write failed.
     """
     with _tombstones_lock:
-        tombstones = load_tombstones(config_dir)
-        channel = tombstones.get(channel_name)
-        if not channel:
+        tombstones = _load_tombstones_for_update(config_dir)
+        if not tombstones or not tombstones.get(channel_name):
             return 0
-        removed = len(channel)
-        del tombstones[channel_name]
-        save_tombstones(config_dir, tombstones)
-        return removed
+        removed = len(tombstones.pop(channel_name))
+        return removed if save_tombstones(config_dir, tombstones) else 0
 
 
 # ---------- retention ----------

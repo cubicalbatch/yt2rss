@@ -4,6 +4,8 @@ import math
 import os
 import tempfile
 import threading
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -108,6 +110,187 @@ def atomic_write_text(path: Path, content: str) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+# Identity of a state file as read: ``(st_ino, st_size, st_mtime_ns)``.
+StateIdentity = tuple[int, int, int]
+
+
+class StateFileError(OSError):
+    """A JSON state file exists but could not be read.
+
+    Raised for I/O failures such as permission errors, EIO or exhausted
+    file descriptors. The data on disk may be perfectly valid, so such a
+    file is never quarantined and callers must never overwrite it.
+    """
+
+
+class CorruptStateFileError(ValueError):
+    """A JSON state file was read but holds invalid content.
+
+    Attributes:
+        identity: Identity of the file that was parsed, used to make sure
+            only that exact file is ever quarantined.
+    """
+
+    def __init__(self, message: str, identity: StateIdentity) -> None:
+        super().__init__(message)
+        self.identity = identity
+
+
+def require_json_object(data: Any) -> None:
+    """Validate that a decoded state file is a JSON object.
+
+    Raises:
+        ValueError: When ``data`` is not a dict.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("state file must contain a JSON object")
+
+
+def _state_identity(info: os.stat_result) -> StateIdentity:
+    """Reduce a stat result to the fields that identify one written file."""
+    return (info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _read_state_bytes(path: Path) -> tuple[bytes, StateIdentity] | None:
+    """Read a state file together with the identity of the inode read.
+
+    Returns:
+        ``(content, identity)``, or None when the file does not exist.
+
+    Raises:
+        StateFileError: When the file exists but could not be read.
+    """
+    try:
+        with open(path, "rb") as handle:
+            identity = _state_identity(os.fstat(handle.fileno()))
+            return handle.read(), identity
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as error:
+        raise StateFileError(f"Cannot read {path}: {error}") from error
+
+
+def read_json_state_strict(
+    path: Path, *, validate: Callable[[Any], None] | None = None
+) -> Any | None:
+    """Read a JSON state file, raising for unreadable or invalid content.
+
+    Use this for state that must fail closed: invalid content raises
+    instead of reading as empty, and the file is always left in place.
+
+    Args:
+        path: State file location.
+        validate: Optional shape check raising ValueError or TypeError.
+
+    Returns:
+        The decoded JSON value, or None when the file does not exist.
+
+    Raises:
+        StateFileError: When the file exists but could not be read.
+        CorruptStateFileError: When the content is not UTF-8 JSON or
+            fails ``validate``.
+    """
+    snapshot = _read_state_bytes(path)
+    if snapshot is None:
+        return None
+    raw, identity = snapshot
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        if validate is not None:
+            validate(data)
+    except (ValueError, TypeError) as error:
+        raise CorruptStateFileError(
+            f"{path.name} is corrupt: {error}", identity
+        ) from error
+    return data
+
+
+def read_json_state(
+    path: Path,
+    *,
+    validate: Callable[[Any], None] | None = None,
+    quarantine: bool = True,
+    logger: logging.Logger | None = None,
+) -> Any | None:
+    """Read a JSON state file, treating corrupt content as empty.
+
+    I/O errors always propagate so callers never mistake an unreadable
+    file for an empty one. Corrupt content is logged and, when
+    ``quarantine`` is set, moved aside by :func:`quarantine_state_file`.
+
+    Args:
+        path: State file location.
+        validate: Optional shape check raising ValueError or TypeError.
+        quarantine: Move a corrupt file aside. Lock-free readers pass
+            False and leave that to writers.
+        logger: Optional logger; defaults to this module's logger.
+
+    Returns:
+        The decoded JSON value, or None when the file is missing or
+        corrupt.
+
+    Raises:
+        StateFileError: When the file exists but could not be read; it is
+            never quarantined for that.
+    """
+    log = logger if logger is not None else logging.getLogger(__name__)
+    try:
+        return read_json_state_strict(path, validate=validate)
+    except CorruptStateFileError as error:
+        if not quarantine:
+            log.error(f"{error}; treating it as empty")
+            return None
+        log.error(f"{error}; starting empty")
+        quarantine_state_file(path, error.identity, log)
+        return None
+
+
+def _free_backup_path(path: Path) -> Path:
+    """Pick a quarantine name that never overwrites an earlier backup."""
+    candidate = path.with_name(f"{path.name}.corrupt")
+    if not os.path.lexists(candidate):
+        return candidate
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    candidate = path.with_name(f"{path.name}.corrupt.{stamp}")
+    counter = 1
+    while os.path.lexists(candidate):
+        candidate = path.with_name(f"{path.name}.corrupt.{stamp}.{counter}")
+        counter += 1
+    return candidate
+
+
+def quarantine_state_file(
+    path: Path, identity: StateIdentity, logger: logging.Logger
+) -> Path | None:
+    """Move a corrupt state file aside unless it changed after parsing.
+
+    Writers replace state files atomically, so by the time a reader has
+    found its copy corrupt the path may already hold a fresh, valid file.
+    Comparing inode, size and mtime with the parsed file keeps such a file
+    in place. The first backup is ``<name>.corrupt``; later ones get a UTC
+    timestamp (and a counter) so earlier backups are never overwritten.
+
+    Args:
+        path: State file location.
+        identity: Identity of the file that was found corrupt.
+        logger: Logger for the outcome.
+
+    Returns:
+        The backup path, or None when the file was left in place.
+    """
+    try:
+        if _state_identity(path.stat()) != identity:
+            logger.warning(f"{path.name} changed after it was read; left in place")
+            return None
+        backup = _free_backup_path(path)
+        path.rename(backup)
+    except OSError as error:
+        logger.error(f"Could not back up corrupt {path.name}: {error}")
+        return None
+    logger.info(f"Kept corrupt {path.name} as {backup.name}")
+    return backup
 
 
 def validate_bounded_number(field: str, value: Any, maximum: float) -> None:

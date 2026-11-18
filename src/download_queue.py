@@ -10,7 +10,8 @@ Concurrency model:
 - All mutations of the queue file run under a :class:`MediaLock` on
   ``download_queue.lock`` so server threads and cron processes serialize
   their read-modify-write cycles. Reads stay lock-free because writes
-  replace the file atomically.
+  replace the file atomically; only locked reads quarantine a corrupt
+  file, and a queue file that cannot be read is never overwritten.
 - Actually downloading a video additionally requires the shared
   ``media.lock`` flock (the same lock refreshes and destructive media
   operations use), so the web server and ``cron_runner`` can never work on
@@ -35,16 +36,18 @@ try:
         apply_retention,
         effective_channel_storage,
         load_storage_settings,
-        pinned_ids,
+        pins_for_deletion,
         tombstoned_ids,
     )
     from .utils import (
         MediaLock,
+        StateFileError,
         atomic_write_text,
         cleanup_episodes,
         contained_path,
         filter_skip_reason,
         load_episode_filters,
+        read_json_state,
     )
 except ImportError:
     from storage import (
@@ -52,16 +55,18 @@ except ImportError:
         apply_retention,
         effective_channel_storage,
         load_storage_settings,
-        pinned_ids,
+        pins_for_deletion,
         tombstoned_ids,
     )
     from utils import (
         MediaLock,
+        StateFileError,
         atomic_write_text,
         cleanup_episodes,
         contained_path,
         filter_skip_reason,
         load_episode_filters,
+        read_json_state,
     )
 
 QUEUE_FILENAME = "download_queue.json"
@@ -124,6 +129,16 @@ class EpisodeFilteredError(Exception):
 
 class StorageLimitError(RuntimeError):
     """Raised when a download is blocked by quota or free-space limits."""
+
+
+def _validate_queue_data(data: Any) -> None:
+    """Require the persisted ``{"jobs": [...]}`` shape.
+
+    Raises:
+        ValueError: When the decoded queue file has another shape.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+        raise ValueError("queue file must be an object with a jobs list")
 
 
 def backoff_delay_seconds(attempt: int) -> float:
@@ -332,7 +347,7 @@ class DownloadQueue:
                 return deepcopy(job)
             return None
 
-        return self._mutate(mutate, {})
+        return self._mutate(mutate, None)
 
     def mark_completed(self, job_id: str) -> dict[str, Any] | None:
         """Mark a running job completed and clear its cancel flag."""
@@ -377,7 +392,7 @@ class DownloadQueue:
             job.update(updates)
             return deepcopy(job)
 
-        return self._mutate(mutate, {})
+        return self._mutate(mutate, None)
 
     def mark_failed_terminal(self, job_id: str, error: str) -> dict[str, Any] | None:
         """Retire a running job as failed immediately, with no retry attempt.
@@ -408,7 +423,7 @@ class DownloadQueue:
             self._forget_memory_flag(job_id)
             return deepcopy(job)
 
-        return self._mutate(mutate, {})
+        return self._mutate(mutate, None)
 
     def defer(
         self, job_id: str, error: str, delay: float = RETRY_BASE_DELAY_SECONDS
@@ -455,7 +470,7 @@ class DownloadQueue:
             self._forget_memory_flag(job_id)
             return deepcopy(job)
 
-        return self._mutate(mutate, {})
+        return self._mutate(mutate, None)
 
     def request_cancel(self, job_id: str) -> dict[str, Any] | None:
         """Cancel a pending job immediately or flag a running job.
@@ -484,7 +499,7 @@ class DownloadQueue:
                 )
             return deepcopy(job)
 
-        return self._mutate(mutate, {})
+        return self._mutate(mutate, None)
 
     def retry(self, job_id: str) -> dict[str, Any] | None:
         """Requeue a failed or cancelled job with a fresh attempt budget."""
@@ -506,7 +521,7 @@ class DownloadQueue:
             self._forget_memory_flag(job_id)
             return deepcopy(job)
 
-        return self._mutate(mutate, {})
+        return self._mutate(mutate, None)
 
     def dismiss(self, job_id: str) -> bool:
         """Remove a terminal (completed, failed, cancelled) job."""
@@ -565,14 +580,16 @@ class DownloadQueue:
             mutator(job)
             return deepcopy(job)
 
-        return self._mutate(mutate, {})
+        return self._mutate(mutate, None)
 
     def recover_interrupted(self) -> int:
         """Requeue jobs left ``running`` by a crashed process."""
         with self._locked() as usable:
             if not usable:
                 return 0
-            job_list = self._load_unlocked()
+            job_list = self._load_for_update()
+            if job_list is None:
+                return 0
             recovered = [job for job in job_list if job.get("state") == "running"]
             for job in recovered:
                 job.update(
@@ -598,7 +615,9 @@ class DownloadQueue:
         with self._locked() as usable:
             if not usable:
                 return False
-            job_list = self._load_unlocked()
+            job_list = self._load_for_update()
+            if job_list is None:
+                return False
             job = self._find(job_list, job_id)
             if job is None or job.get("state") != "running":
                 return False
@@ -629,34 +648,47 @@ class DownloadQueue:
             self._lock.release()
 
     def _read_jobs(self) -> list[dict[str, Any]]:
-        """Read jobs without acquiring the lock (writes are atomic)."""
+        """Read jobs without acquiring the lock (writes are atomic).
+
+        A corrupt file is left for a locked reader to quarantine: by the
+        time this reader parsed it, a writer may already have replaced it.
+        An unreadable file reads as empty (logged) and is left untouched.
+        """
         try:
-            raw = self.file_path.read_text(encoding="utf-8")
-        except (FileNotFoundError, NotADirectoryError):
-            return []
-        except OSError as error:
+            return self._load(quarantine=False)
+        except StateFileError as error:
             self.logger.error(f"Error reading download queue: {error}")
             return []
-        return self._parse_jobs(raw)
 
-    def _parse_jobs(self, raw: str) -> list[dict[str, Any]]:
-        """Parse and validate queue JSON, quarantining corrupt files."""
+    def _load_for_update(self) -> list[dict[str, Any]] | None:
+        """Load jobs while holding the queue lock, quarantining corruption.
+
+        Returns:
+            The jobs, or None (logged) when the file cannot be read; the
+            caller must then abort without saving.
+        """
         try:
-            data = json.loads(raw)
-            if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
-                raise ValueError("queue file must be an object with a jobs list")
-        except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as error:
-            self.logger.error(
-                f"Download queue file is corrupt ({error}); starting empty"
-            )
-            backup = Path(f"{self.file_path}.corrupt")
-            try:
-                self.file_path.replace(backup)
-                self.logger.info(f"Kept corrupt queue as {backup.name}")
-            except OSError as backup_error:
-                self.logger.error(
-                    f"Could not back up corrupt queue file: {backup_error}"
-                )
+            return self._load(quarantine=True)
+        except StateFileError as error:
+            self.logger.error(f"Download queue not modified: {error}")
+            return None
+
+    def _load(self, *, quarantine: bool) -> list[dict[str, Any]]:
+        """Read, validate and normalize the persisted jobs.
+
+        Args:
+            quarantine: Move a corrupt queue file aside.
+
+        Raises:
+            StateFileError: When the queue file cannot be read.
+        """
+        data = read_json_state(
+            self.file_path,
+            validate=_validate_queue_data,
+            quarantine=quarantine,
+            logger=self.logger,
+        )
+        if data is None:
             return []
         jobs: list[dict[str, Any]] = []
         for entry in data["jobs"]:
@@ -692,17 +724,6 @@ class DownloadQueue:
         )
         return normalized
 
-    def _load_unlocked(self) -> list[dict[str, Any]]:
-        """Load jobs while already holding the queue lock."""
-        try:
-            raw = self.file_path.read_text(encoding="utf-8")
-        except (FileNotFoundError, NotADirectoryError):
-            return []
-        except OSError as error:
-            self.logger.error(f"Error reading download queue: {error}")
-            return []
-        return self._parse_jobs(raw)
-
     def _save_unlocked(self, job_list: list[dict[str, Any]]) -> None:
         """Bound the completed history and persist atomically."""
         completed = sorted(
@@ -717,11 +738,18 @@ class DownloadQueue:
         atomic_write_text(self.file_path, json.dumps({"jobs": job_list}, indent=2))
 
     def _mutate(self, mutator: Callable[[Any], Any], empty: Any) -> Any:
-        """Run a read-modify-write cycle under the queue lock."""
+        """Run a read-modify-write cycle under the queue lock.
+
+        Returns ``empty`` without saving when the config directory vanished
+        or the queue file cannot be read, so a failed read never replaces
+        the persisted jobs with an empty list.
+        """
         with self._locked() as usable:
             if not usable:
                 return empty
-            job_list = self._load_unlocked()
+            job_list = self._load_for_update()
+            if job_list is None:
+                return empty
             result = mutator(job_list)
             self._save_unlocked(job_list)
             return result
@@ -754,7 +782,7 @@ class DownloadQueue:
             self._forget_memory_flag(job_id)
             return deepcopy(job)
 
-        return self._mutate(mutate, {})
+        return self._mutate(mutate, None)
 
     def _remember_memory_flag(self, job_id: str) -> None:
         """Record an in-process cancel request for instant hook checks."""
@@ -804,7 +832,8 @@ def execute_queue_job(
     read at all it fails with :class:`ConfigUnavailableError` so the worker
     defers it instead. After a successful (or already
     present) download the per-channel refresh timestamp is updated and the
-    episode cleanup that ``process_channel`` used to perform runs.
+    episode cleanup that ``process_channel`` used to perform runs; a
+    failure of that cleanup is logged and never fails the job.
 
     Args:
         job: Persisted job record.
@@ -826,6 +855,8 @@ def execute_queue_job(
             worker retires such jobs as cancelled.
         StorageLimitError: When quota or free-space protection blocks the
             download; the worker retires such jobs as terminal failures.
+        StateFileError: When ``tombstones.json`` cannot be read; the job
+            fails closed and is retried with the normal backoff.
         RuntimeError: When the download failed.
     """
     queue_logger = logger if logger is not None else logging.getLogger(__name__)
@@ -906,16 +937,11 @@ def execute_queue_job(
                 )
 
         downloader.rss_generator.update_channel_refresh_time(channel_name)
-        cleanup_episodes(
-            videos_dir,
-            channel_name,
-            max_episodes,
-            pinned=pinned_ids(config_path.parent, channel_name),
-        )
-        _apply_job_retention(
+        _prune_after_download(
             channel=channel,
+            max_episodes=max_episodes,
             videos_dir=videos_dir,
-            config_path=config_path,
+            config_dir=config_path.parent,
             global_config=global_config,
             logger=queue_logger,
         )
@@ -953,6 +979,11 @@ def _check_episode_filters(
         channel: The channel's *current* configuration entry.
         config_dir: Directory holding ``tombstones.json``.
         downloader: Downloader used for on-demand metadata fetches.
+
+    Raises:
+        EpisodeFilteredError: When the video is filtered or tombstoned.
+        StateFileError: When ``tombstones.json`` cannot be read; nothing
+            may be downloaded without knowing the user's deletions.
     """
     video_id = job["video_id"]
     if video_id in tombstoned_ids(config_dir, job["channel"]):
@@ -999,19 +1030,61 @@ def _check_storage_admission(
         raise StorageLimitError(blocked)
 
 
+def _prune_after_download(
+    *,
+    channel: dict[str, Any],
+    max_episodes: int,
+    videos_dir: Path,
+    config_dir: Path,
+    global_config: dict[str, Any],
+    logger: logging.Logger,
+) -> None:
+    """Run ``max_episodes`` cleanup and retention after a completed download.
+
+    The download already succeeded, so failures here are logged and never
+    turn the job into a failed or retried one. An unusable ``pins.json``
+    skips both passes: deleting without knowing the pins could remove
+    pinned episodes irreversibly.
+
+    Args:
+        channel: The channel's current configuration entry.
+        max_episodes: Number of newest unpinned episodes to keep.
+        videos_dir: Media storage root.
+        config_dir: Directory holding ``pins.json``.
+        global_config: Configuration keys outside ``channels``.
+        logger: Logger for queue-level messages.
+    """
+    channel_name = channel["name"]
+    pinned = pins_for_deletion(
+        config_dir, channel_name, logger, "post-download cleanup and retention"
+    )
+    if pinned is None:
+        return
+    try:
+        cleanup_episodes(videos_dir, channel_name, max_episodes, pinned=pinned)
+        _apply_job_retention(
+            channel=channel,
+            videos_dir=videos_dir,
+            global_config=global_config,
+            pinned=pinned,
+            logger=logger,
+        )
+    except Exception as error:  # The download is complete; never fail the job.
+        logger.error(f"Post-download cleanup failed for {channel_name}: {error}")
+
+
 def _apply_job_retention(
     *,
     channel: dict[str, Any],
     videos_dir: Path,
-    config_path: Path,
     global_config: dict[str, Any],
+    pinned: set[str],
     logger: logging.Logger,
 ) -> int:
     """Apply the channel's effective retention after its download completed."""
     effective = effective_channel_storage(load_storage_settings(global_config), channel)
     if effective["retention_days"] <= 0:
         return 0
-    pinned = pinned_ids(config_path.parent, channel["name"])
     removed = apply_retention(
         videos_dir,
         channel["name"],

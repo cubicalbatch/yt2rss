@@ -6,6 +6,8 @@ and the tombstone lifecycle (record, skip, forget, purge, corrupt file).
 """
 
 import json
+import logging
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, ClassVar
@@ -14,6 +16,7 @@ from unittest.mock import Mock, patch
 import pytest
 import yaml
 
+from src.health import load_health
 from src.storage import (
     load_tombstones,
     record_tombstone,
@@ -26,6 +29,7 @@ from src.utils import (
     MAX_TITLE_FILTER_LENGTH,
     MAX_TITLE_FILTER_RULES,
     SHORTS_MAX_DURATION_SECONDS,
+    StateFileError,
     filter_skip_reason,
     is_livestream_entry,
     load_episode_filters,
@@ -71,6 +75,20 @@ def channel_entry(test_server, channel_name: str = "test_channel", **overrides):
 def recent_log_text(test_server) -> str:
     """Join the server's UI log messages for assertions."""
     return "\n".join(entry["message"] for entry in test_server.recent_logs)
+
+
+def tombstone_backups(config_dir: Path) -> list[Path]:
+    """List quarantine backups of ``tombstones.json``."""
+    path = tombstones_path(config_dir)
+    return sorted(path.parent.glob(f"{path.name}.corrupt*"))
+
+
+def make_tombstones_unreadable(config_dir: Path, unreadable_files) -> bytes:
+    """Record one tombstone, then make the file unreadable; return its bytes."""
+    record_tombstone(config_dir, "test_channel", "video1", "Deleted video1")
+    path = tombstones_path(config_dir)
+    unreadable_files(path)
+    return path.read_bytes()
 
 
 class FakeDiscoveryDownloader:
@@ -458,6 +476,35 @@ class TestTombstoneStore:
         assert load_tombstones(tmp_path) == {}
         assert Path(f"{tombstones_path(tmp_path)}.corrupt").is_file()
 
+    def test_unreadable_file_raises_and_is_never_quarantined(
+        self, tmp_path, unreadable_files
+    ):
+        original = make_tombstones_unreadable(tmp_path, unreadable_files)
+        with pytest.raises(StateFileError, match="Permission denied"):
+            load_tombstones(tmp_path)
+        with pytest.raises(StateFileError):
+            tombstoned_ids(tmp_path, "test_channel")
+        assert tombstones_path(tmp_path).read_bytes() == original
+        assert tombstone_backups(tmp_path) == []
+
+    def test_writers_never_overwrite_unreadable_file(self, tmp_path, unreadable_files):
+        original = make_tombstones_unreadable(tmp_path, unreadable_files)
+        assert record_tombstone(tmp_path, "test_channel", "video2", "Two") is False
+        assert remove_episode_tombstone(tmp_path, "test_channel", "video1") is False
+        assert remove_channel_tombstones(tmp_path, "test_channel") == 0
+        assert tombstones_path(tmp_path).read_bytes() == original
+        assert tombstone_backups(tmp_path) == []
+
+    def test_lock_free_read_leaves_corrupt_file_for_writers(self, tmp_path):
+        path = tombstones_path(tmp_path)
+        path.write_text("{not json", encoding="utf-8")
+        assert tombstoned_ids(tmp_path, "test_channel") == set()
+        assert path.read_text(encoding="utf-8") == "{not json"
+        # The next locked write quarantines it and starts fresh.
+        assert record_tombstone(tmp_path, "test_channel", "video2", "Two") is True
+        assert Path(f"{path}.corrupt").read_text(encoding="utf-8") == "{not json"
+        assert tombstoned_ids(tmp_path, "test_channel") == {"video2"}
+
     def test_invalid_entries_dropped(self, tmp_path):
         tombstones_path(tmp_path).write_text(
             json.dumps(
@@ -577,6 +624,24 @@ class TestDiscoveryFiltering:
         assert "vid_trailer" not in queued_ids
         assert "deleted by the user" in recent_log_text(test_server)
 
+    def test_unreadable_tombstones_queue_nothing_and_fail_refresh(
+        self, test_server, unreadable_files
+    ):
+        make_tombstones_unreadable(test_server.config_dir, unreadable_files)
+        downloader = FakeDiscoveryDownloader(self.flat_videos())
+        setattr(downloader, "logger", logging.getLogger("fake-discovery"))
+        setattr(downloader, "last_channel_error", None)
+
+        assert test_server._begin_refresh()
+        with patch("src.downloader.YouTubeDownloader", return_value=downloader):
+            test_server._run_refresh("test_channel")
+
+        assert test_server.queue.jobs() == []
+        state = load_health(test_server.config_dir)["channels"]["test_channel"]
+        assert state["consecutive_failures"] == 1
+        assert state["history"][-1]["status"] == "failure"
+        assert "tombstones.json" in state["last_error"]
+
     def test_metadata_not_fetched_for_cheap_skips(self, test_server):
         downloader = FakeDiscoveryDownloader(self.flat_videos())
         self.discover(test_server, downloader, title_exclude=["trailer"])
@@ -622,6 +687,28 @@ class TestExecutionFiltering:
         state = test_server.queue.get(job["id"])
         assert "deleted by the user" in state["error"]
         assert StubDownloader.instances[-1].download_calls == []
+
+    def test_unreadable_tombstones_fail_attempt_without_download(
+        self, test_server, fast_worker, unreadable_files
+    ):
+        record_tombstone(test_server.config_dir, "test_channel", "other", "Other")
+        unreadable_files(tombstones_path(test_server.config_dir))
+        with patch("src.downloader.YouTubeDownloader", StubDownloader):
+            job = enqueue_job(test_server.queue)
+            assert wait_until(
+                lambda: (
+                    (state := test_server.queue.get(job["id"]))
+                    and state["attempts"] == 1
+                    and state["state"] == "pending"
+                    and state["error"]
+                )
+            )
+        state = test_server.queue.get(job["id"])
+        # A normal failed attempt: retried with backoff, never downloaded.
+        assert "tombstones.json" in state["error"]
+        assert state["next_attempt_at"] > time.time()
+        assert StubDownloader.instances[-1].download_calls == []
+        assert not (test_server.videos_dir / "test_channel" / "video1.mp4").exists()
 
     def test_duration_filters_fetch_metadata_and_cancel(self, test_server, fast_worker):
         update_channel_config(test_server, min_duration_seconds=600)
@@ -698,6 +785,18 @@ class TestFeedAndEpisodesVisibility:
         data = json.loads(episodes.data)
         assert data["total_count"] == 1
         assert [episode["id"] for episode in data["episodes"]] == ["test123abc"]
+
+    def test_unreadable_tombstones_do_not_break_feed_or_api(
+        self, client, test_server, setup_test_episodes, unreadable_files
+    ):
+        make_tombstones_unreadable(test_server.config_dir, unreadable_files)
+        feed = client.get("/feeds/test_channel")
+        assert feed.status_code == 200
+        assert b"Test Episode: How to Test" in feed.data
+        episodes = client.get("/api/channels/test_channel/episodes")
+        assert episodes.status_code == 200
+        assert json.loads(episodes.data)["total_count"] == 2
+        assert client.get("/").status_code == 200
 
     def test_media_of_hidden_episode_is_still_served(
         self, client, test_server, setup_test_episodes
@@ -799,6 +898,21 @@ class TestTombstoneAPIs:
         response = client.delete("/api/channels/nonexistent/tombstones/vid1")
         assert response.status_code == 404
 
+    def test_unreadable_tombstones_return_clear_error(
+        self, client, test_server, unreadable_files
+    ):
+        original = make_tombstones_unreadable(test_server.config_dir, unreadable_files)
+        base = "/api/channels/test_channel/tombstones"
+        for response in (
+            client.get(base),
+            client.delete(base),
+            client.delete(f"{base}/video1"),
+        ):
+            assert response.status_code == 500
+            assert "tombstones.json cannot be read" in response.get_json()["error"]
+        assert tombstones_path(test_server.config_dir).read_bytes() == original
+        assert tombstone_backups(test_server.config_dir) == []
+
     def test_empty_tombstones_list(self, client, test_server):
         response = client.get("/api/channels/test_channel/tombstones")
         data = json.loads(response.data)
@@ -820,6 +934,20 @@ class TestTombstoneLifecycle:
         )
         assert data["test_channel"]["test123abc"]["deleted_at"]
         assert not (setup_test_episodes / "test123abc.m4a").exists()
+
+    def test_delete_refused_while_tombstones_unreadable(
+        self, client, test_server, setup_test_episodes, unreadable_files
+    ):
+        original = make_tombstones_unreadable(test_server.config_dir, unreadable_files)
+        response = client.delete(
+            "/api/channels/test_channel/episodes/test123abc/delete"
+        )
+        assert response.status_code == 500
+        assert "tombstones.json cannot be read" in response.get_json()["error"]
+        # Nothing was deleted, so nothing can come back unremembered.
+        assert (setup_test_episodes / "test123abc.m4a").exists()
+        assert (setup_test_episodes / "test123abc.json").exists()
+        assert tombstones_path(test_server.config_dir).read_bytes() == original
 
     def test_refresh_skips_deleted_episode(self, test_server):
         record_tombstone(test_server.config_dir, "test_channel", "vid1", "Deleted one")

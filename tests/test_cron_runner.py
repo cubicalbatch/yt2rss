@@ -14,6 +14,7 @@ import yaml
 
 from src.cron_runner import AutomationRunner
 from src.health import load_health, record_refresh
+from src.storage import pins_path, record_tombstone, tombstones_path
 
 
 @pytest.fixture
@@ -185,6 +186,34 @@ class TestErrorHandling:
         # Should not raise exception
         automation_runner.cleanup_old_videos("test_channel", 1)
 
+    @pytest.mark.parametrize("mode", ["corrupt", "unreadable"])
+    def test_cleanup_skipped_while_pins_unusable(
+        self, automation_runner, temp_directory, unreadable_files, mode
+    ):
+        """A broken pins.json pauses cleanup instead of deleting pinned files."""
+        channel_dir = temp_directory / "appdata" / "podcasts" / "test_channel"
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        for index in range(3):
+            episode = {"id": f"ep{index}", "upload_date": f"2024110{index + 1}"}
+            (channel_dir / f"ep{index}.json").write_text(json.dumps(episode))
+            (channel_dir / f"ep{index}.m4a").write_text("audio data")
+        pins = pins_path(automation_runner.config_path.parent)
+        if mode == "corrupt":
+            pins.write_text('{"test_channel": ["ep0"')
+        else:
+            pins.write_text(json.dumps({"test_channel": ["ep0"]}))
+            unreadable_files(pins)
+        original = pins.read_bytes()
+        automation_runner.logger.error = Mock()
+
+        automation_runner.cleanup_old_videos("test_channel", 1)
+
+        assert len(list(channel_dir.glob("*.m4a"))) == 3
+        assert pins.read_bytes() == original
+        message = automation_runner.logger.error.call_args.args[0]
+        assert "Skipping cleanup for test_channel" in message
+        assert "pins.json is repaired or removed" in message
+
     def test_file_system_errors_during_cleanup(self, automation_runner, temp_directory):
         """Test cleanup with file system errors."""
         channel_dir = temp_directory / "appdata" / "podcasts" / "test_channel"
@@ -277,6 +306,39 @@ class TestCronHealth:
         with patch("src.cron_runner.dispatch_events") as dispatch:
             automation_runner.notify_health({})
         dispatch.assert_not_called()
+
+    def test_unreadable_tombstones_record_failure_without_download(
+        self, automation_runner, test_config, temp_directory, unreadable_files
+    ):
+        """Inline discovery fails closed instead of re-downloading deletions."""
+        from src.downloader import YouTubeDownloader
+
+        config_dir = automation_runner.config_path.parent
+        downloader = YouTubeDownloader(
+            str(automation_runner.config_path),
+            videos_dir=str(temp_directory / "appdata" / "podcasts"),
+        )
+        automation_runner.downloader = downloader
+        record_tombstone(config_dir, "test_channel_1", "deleted1", "Deleted")
+        unreadable_files(tombstones_path(config_dir))
+        video = {
+            "id": "deleted1",
+            "title": "Deleted",
+            "url": "https://www.youtube.com/watch?v=deleted1",
+        }
+        with (
+            patch.object(downloader, "get_channel_videos", return_value=[video]),
+            patch.object(downloader, "get_video_metadata") as metadata,
+            patch.object(downloader, "download_video") as download,
+        ):
+            result = automation_runner.process_channel(test_config["channels"][0], {})
+
+        assert result is False
+        metadata.assert_not_called()
+        download.assert_not_called()
+        state = load_health(config_dir)["channels"]["test_channel_1"]
+        assert state["consecutive_failures"] == 1
+        assert "tombstones.json" in state["last_error"]
 
 
 class TestCronQueueDrain:

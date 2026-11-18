@@ -2,6 +2,7 @@
 
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.error import URLError
 
@@ -23,6 +24,7 @@ from src.health import (
     save_health,
     validate_notification_settings,
 )
+from src.utils import StateFileError
 from tests.test_web_server import app_config as app_config
 from tests.test_web_server import client as client
 from tests.test_web_server import test_server as test_server
@@ -47,6 +49,19 @@ def settings(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def health_backups(config_dir) -> list[Path]:
+    """List quarantine backups of ``health.json``."""
+    path = health_path(config_dir)
+    return sorted(path.parent.glob(f"{path.name}.corrupt*"))
+
+
+def make_health_unreadable(config_dir, unreadable_files) -> bytes:
+    """Record history for ``test_channel``, then block reads; return bytes."""
+    record_failure(config_dir, count=3, error="boom")
+    unreadable_files(health_path(config_dir))
+    return health_path(config_dir).read_bytes()
 
 
 def record_failure(config_dir, channel="test_channel", count=1, **kwargs):
@@ -103,6 +118,45 @@ class TestHealthStore:
         data = load_health(tmp_path)
         assert data["channels"] == {}
         assert health_path(tmp_path).with_suffix(".json.corrupt").is_file()
+
+    def test_unreadable_file_raises_and_is_untouched(self, tmp_path, unreadable_files):
+        original = make_health_unreadable(tmp_path, unreadable_files)
+        with pytest.raises(StateFileError, match="Permission denied"):
+            load_health(tmp_path)
+        assert health_path(tmp_path).read_bytes() == original
+        assert health_backups(tmp_path) == []
+
+    def test_writers_never_overwrite_unreadable_file(self, tmp_path, unreadable_files):
+        original = make_health_unreadable(tmp_path, unreadable_files)
+        state = record_refresh(tmp_path, "test_channel", success=False, error="x")
+        # Reported for this refresh only; the stored history is not reset.
+        assert state["consecutive_failures"] == 1
+        assert remove_channel_health(tmp_path, "test_channel") is False
+        with patch("src.health.urlopen", return_value=fake_response()):
+            results = dispatch_events(
+                tmp_path,
+                [{"key": "x", "event": "test", "message": "m"}],
+                "https://example.test/hook",
+            )
+        assert results[0]["ok"] is True
+        assert health_path(tmp_path).read_bytes() == original
+        assert health_backups(tmp_path) == []
+
+    def test_readers_degrade_to_empty_when_unreadable(self, tmp_path, unreadable_files):
+        make_health_unreadable(tmp_path, unreadable_files)
+        assert health_summary(tmp_path) == {"channels": {}, "notifications": {}}
+        assert collect_events(tmp_path, settings(failure_threshold=1)) == []
+        events = collect_events(tmp_path, settings(), free_bytes=1, min_free_space_gb=5)
+        assert [event["event"] for event in events] == ["low_disk_space"]
+
+    def test_lock_free_readers_leave_corrupt_file_for_writers(self, tmp_path):
+        health_path(tmp_path).write_text("{not json")
+        assert health_summary(tmp_path)["channels"] == {}
+        assert collect_events(tmp_path, settings()) == []
+        assert health_path(tmp_path).read_text() == "{not json"
+        record_refresh(tmp_path, "test_channel", success=True)
+        assert Path(f"{health_path(tmp_path)}.corrupt").read_text() == "{not json"
+        assert "test_channel" in load_health(tmp_path)["channels"]
 
     def test_invalid_entries_are_dropped(self, tmp_path):
         health_path(tmp_path).write_text(
@@ -472,3 +526,28 @@ class TestRefreshIntegration:
         record_refresh(test_server.config_dir, "test_channel", success=True)
         assert client.delete("/api/channels/test_channel").status_code == 200
         assert "test_channel" not in load_health(test_server.config_dir)["channels"]
+
+    def test_scheduler_falls_back_to_timestamps_when_unreadable(
+        self, test_server, unreadable_files
+    ):
+        fallback = "2026-01-01T00:00:00+00:00"
+        (test_server.config_dir / "refresh_timestamps.json").write_text(
+            json.dumps({"test_channel": fallback})
+        )
+        record_refresh(
+            test_server.config_dir,
+            "test_channel",
+            success=True,
+            at="2026-02-01T00:00:00+00:00",
+        )
+        assert test_server._last_refresh_attempts()["test_channel"] == datetime(
+            2026, 2, 1, tzinfo=UTC
+        )
+        original = health_path(test_server.config_dir).read_bytes()
+        unreadable_files(health_path(test_server.config_dir))
+
+        attempts = test_server._last_refresh_attempts()
+
+        assert attempts["test_channel"] == datetime(2026, 1, 1, tzinfo=UTC)
+        assert health_path(test_server.config_dir).read_bytes() == original
+        assert health_backups(test_server.config_dir) == []

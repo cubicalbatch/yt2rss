@@ -19,6 +19,7 @@ from src.storage import (
     DEFAULT_ESTIMATE_AUDIO_BYTES,
     DEFAULT_ESTIMATE_VIDEO_BYTES,
     GB,
+    PinsUnavailableError,
     admission_error,
     apply_retention,
     channel_usage,
@@ -29,10 +30,22 @@ from src.storage import (
     load_storage_settings,
     measure_media_usage,
     pinned_ids,
+    pins_path,
+    remove_channel_pins,
+    remove_episode_pin,
     set_episode_pinned,
     validate_storage_settings,
 )
-from src.utils import cleanup_episodes, validate_channel_settings
+from src.utils import (
+    CorruptStateFileError,
+    StateFileError,
+    atomic_write_text,
+    cleanup_episodes,
+    read_json_state,
+    read_json_state_strict,
+    require_json_object,
+    validate_channel_settings,
+)
 from tests.test_auth import auth_client as auth_client
 from tests.test_auth import auth_server as auth_server
 from tests.test_download_queue import StubDownloader, enqueue_job
@@ -93,6 +106,121 @@ def make_episode(channel_dir, episode_id, upload_date, size=1000, mtime=None):
     if mtime is not None:
         os.utime(media, (mtime, mtime))
     return media
+
+
+def state_backups(path: Path) -> list[Path]:
+    """List quarantine backups (``<name>.corrupt*``) of a state file."""
+    return sorted(path.parent.glob(f"{path.name}.corrupt*"))
+
+
+def break_pins(config_dir: Path, mode: str, unreadable_files) -> bytes:
+    """Make ``pins.json`` corrupt or unreadable and return its bytes.
+
+    The unreadable variant holds valid pins for ``a`` in ``test_channel``,
+    so any deletion of ``a`` would prove the pins were ignored.
+    """
+    path = pins_path(config_dir)
+    if mode == "corrupt":
+        path.write_text('{"test_channel": ["a", ', encoding="utf-8")
+    else:
+        path.write_text(json.dumps({"test_channel": ["a"]}), encoding="utf-8")
+        unreadable_files(path)
+    return path.read_bytes()
+
+
+class TestStateFileHelper:
+    """read_json_state: missing, unreadable, corrupt and replaced files."""
+
+    def test_missing_file_reads_as_none(self, tmp_path):
+        assert read_json_state(tmp_path / "state.json") is None
+        assert read_json_state_strict(tmp_path / "state.json") is None
+
+    def test_valid_file_is_returned(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text('{"a": 1}')
+        assert read_json_state(path, validate=require_json_object) == {"a": 1}
+
+    def test_io_error_raises_and_leaves_file_untouched(
+        self, tmp_path, unreadable_files
+    ):
+        path = tmp_path / "state.json"
+        # Even corrupt bytes must never be quarantined after a failed read.
+        path.write_text("{not json")
+        unreadable_files(path)
+        with pytest.raises(StateFileError, match="Permission denied"):
+            read_json_state(path)
+        with pytest.raises(StateFileError):
+            read_json_state_strict(path)
+        assert path.read_bytes() == b"{not json"
+        assert state_backups(path) == []
+
+    def test_corrupt_file_is_quarantined(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text("{not json")
+        assert read_json_state(path) is None
+        assert not path.exists()
+        assert Path(f"{path}.corrupt").read_text() == "{not json"
+
+    def test_failed_validation_counts_as_corrupt(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text("[1, 2]")
+        assert read_json_state(path, validate=require_json_object) is None
+        assert Path(f"{path}.corrupt").read_text() == "[1, 2]"
+
+    def test_undecodable_bytes_count_as_corrupt(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_bytes(b"\xff\xfe\x00garbage")
+        assert read_json_state(path) is None
+        assert Path(f"{path}.corrupt").read_bytes() == b"\xff\xfe\x00garbage"
+
+    def test_later_corruptions_never_overwrite_earlier_backups(self, tmp_path):
+        path = tmp_path / "state.json"
+        for content in ("first", "second", "third"):
+            path.write_text(f"{content} corruption")
+            assert read_json_state(path) is None
+        first = Path(f"{path}.corrupt")
+        assert first.read_text() == "first corruption"
+        backups = state_backups(path)
+        assert len(backups) == 3
+        assert sorted(backup.read_text() for backup in backups) == [
+            "first corruption",
+            "second corruption",
+            "third corruption",
+        ]
+        assert all(
+            backup.name.startswith("state.json.corrupt.")
+            for backup in backups
+            if backup != first
+        )
+
+    def test_quarantine_disabled_leaves_file_in_place(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text("{not json")
+        assert read_json_state(path, quarantine=False) is None
+        assert path.read_text() == "{not json"
+        assert state_backups(path) == []
+
+    def test_file_replaced_after_parsing_is_not_quarantined(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text("[1]")
+
+        def replace_then_reject(data):
+            # A writer atomically replaces the file while this reader is
+            # still deciding that its (old) copy is invalid.
+            atomic_write_text(path, '{"fresh": true}')
+            raise ValueError("wrong shape")
+
+        assert read_json_state(path, validate=replace_then_reject) is None
+        assert json.loads(path.read_text()) == {"fresh": True}
+        assert state_backups(path) == []
+
+    def test_strict_read_raises_and_keeps_corrupt_file(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text("{not json")
+        with pytest.raises(CorruptStateFileError, match="state.json is corrupt"):
+            read_json_state_strict(path)
+        assert path.read_text() == "{not json"
+        assert state_backups(path) == []
 
 
 class TestSettingsValidation:
@@ -1124,3 +1252,174 @@ class TestMaintenance:
         make_episode(channel_dir, "kept", "", mtime=0)
         test_server._run_storage_maintenance()
         assert (channel_dir / "kept.m4a").exists()
+
+
+BROKEN_PIN_MODES = pytest.mark.parametrize("mode", ["corrupt", "unreadable"])
+
+
+class TestPinsFailClosed:
+    """A corrupt or unreadable pins.json never reads as "nothing pinned"."""
+
+    @staticmethod
+    def seed_old_episodes(test_server) -> Path:
+        """Store three old test_channel episodes and enable retention."""
+        channel_dir = test_server.videos_dir / "test_channel"
+        for episode_id, upload_date in (
+            ("a", "20200101"),
+            ("b", "20200201"),
+            ("c", "20200301"),
+        ):
+            make_episode(channel_dir, episode_id, upload_date)
+        config = write_config(test_server)
+        config["channels"][0]["retention_days"] = 30
+        config["channels"][0]["max_episodes"] = 1
+        (test_server.config_dir / "channels.yaml").write_text(yaml.safe_dump(config))
+        return channel_dir
+
+    @staticmethod
+    def surviving(channel_dir: Path) -> list[str]:
+        return sorted(path.stem for path in channel_dir.glob("*.m4a"))
+
+    @BROKEN_PIN_MODES
+    def test_load_pins_raises_and_keeps_file(self, tmp_path, unreadable_files, mode):
+        original = break_pins(tmp_path, mode, unreadable_files)
+        with pytest.raises(PinsUnavailableError, match="repaired or removed"):
+            load_pins(tmp_path)
+        with pytest.raises(PinsUnavailableError):
+            pinned_ids(tmp_path, "test_channel")
+        assert pins_path(tmp_path).read_bytes() == original
+        assert state_backups(pins_path(tmp_path)) == []
+
+    def test_wrong_shape_is_corrupt(self, tmp_path):
+        pins_path(tmp_path).write_text(json.dumps({"test_channel": "a"}))
+        with pytest.raises(PinsUnavailableError):
+            load_pins(tmp_path)
+
+    def test_missing_file_means_nothing_pinned(self, tmp_path):
+        assert load_pins(tmp_path) == {}
+        assert pinned_ids(tmp_path, "test_channel") == set()
+
+    @BROKEN_PIN_MODES
+    def test_pin_writers_never_overwrite(self, tmp_path, unreadable_files, mode):
+        original = break_pins(tmp_path, mode, unreadable_files)
+        assert set_episode_pinned(tmp_path, "test_channel", "b", True) is False
+        assert set_episode_pinned(tmp_path, "test_channel", "a", False) is False
+        assert remove_episode_pin(tmp_path, "test_channel", "a") is False
+        assert remove_channel_pins(tmp_path, "test_channel") is False
+        assert pins_path(tmp_path).read_bytes() == original
+        assert state_backups(pins_path(tmp_path)) == []
+
+    @BROKEN_PIN_MODES
+    def test_cleanup_and_retention_delete_nothing(
+        self, test_server, unreadable_files, mode
+    ):
+        channel_dir = self.seed_old_episodes(test_server)
+        break_pins(test_server.config_dir, mode, unreadable_files)
+        test_server.logger.error = Mock()
+        config = test_server._load_channel_config()
+
+        test_server._cleanup_old_episodes("test_channel", 1)
+        assert test_server._apply_channel_retention(config["channels"][0], config) == 0
+        test_server._run_storage_maintenance()
+
+        # Pinned "a" and the unpinned episodes all survive.
+        assert self.surviving(channel_dir) == ["a", "b", "c"]
+        logged = " ".join(
+            str(call.args[0]) for call in test_server.logger.error.call_args_list
+        )
+        assert "Skipping cleanup for test_channel" in logged
+        assert "Skipping retention for test_channel" in logged
+        assert "pins.json is repaired or removed" in logged
+
+    def test_cleanup_resumes_once_pins_are_repaired(self, test_server):
+        channel_dir = self.seed_old_episodes(test_server)
+        pins_path(test_server.config_dir).write_text("{broken")
+        test_server._cleanup_old_episodes("test_channel", 1)
+        assert self.surviving(channel_dir) == ["a", "b", "c"]
+
+        pins_path(test_server.config_dir).write_text(
+            json.dumps({"test_channel": ["a"]})
+        )
+        test_server._cleanup_old_episodes("test_channel", 1)
+        assert self.surviving(channel_dir) == ["a", "c"]
+
+    @BROKEN_PIN_MODES
+    def test_pin_toggle_refuses_and_keeps_file(
+        self, client, test_server, setup_test_episodes, unreadable_files, mode
+    ):
+        original = break_pins(test_server.config_dir, mode, unreadable_files)
+        url = "/api/channels/test_channel/episodes/test123abc/pin"
+        for response in (client.post(url), client.delete(url)):
+            assert response.status_code == 500
+            assert "pins.json is corrupt or unreadable" in response.get_json()["error"]
+        assert pins_path(test_server.config_dir).read_bytes() == original
+        assert state_backups(pins_path(test_server.config_dir)) == []
+
+    @BROKEN_PIN_MODES
+    def test_read_only_views_still_respond(
+        self, client, test_server, setup_test_episodes, unreadable_files, mode
+    ):
+        break_pins(test_server.config_dir, mode, unreadable_files)
+
+        storage = client.get("/api/storage")
+        assert storage.status_code == 200
+        data = storage.get_json()
+        assert data["totals"]["episodes"] == 2
+        assert data["totals"]["pinned"] == 0
+        assert "pins.json" in data["pins_error"]
+
+        episodes = client.get("/api/channels/test_channel/episodes")
+        assert episodes.status_code == 200
+        flags = [episode["pinned"] for episode in episodes.get_json()["episodes"]]
+        assert flags == [False, False]
+
+    def test_storage_report_has_no_pins_error_when_healthy(
+        self, client, setup_test_episodes
+    ):
+        assert client.get("/api/storage").get_json()["pins_error"] is None
+
+    @staticmethod
+    def drain_one(test_server, job):
+        """Claim and run one job through the real worker translation."""
+        worker = QueueWorker(
+            test_server.queue,
+            executor=test_server._execute_queue_job,
+            media_lock=None,
+            logger=test_server.logger,
+        )
+        claimed = test_server.queue.claim_next()
+        assert claimed is not None and claimed["id"] == job["id"]
+        worker._execute(claimed)
+
+    @BROKEN_PIN_MODES
+    def test_completed_download_survives_skipped_cleanup(
+        self, test_server, unreadable_files, mode
+    ):
+        test_server.queue_worker.stop()
+        channel_dir = self.seed_old_episodes(test_server)
+        break_pins(test_server.config_dir, mode, unreadable_files)
+        job = enqueue_job(test_server.queue, video_id="fresh")
+        with patch("src.downloader.YouTubeDownloader", StubDownloader):
+            self.drain_one(test_server, job)
+
+        stored = test_server.queue.get(job["id"])
+        assert stored["state"] == "completed"
+        assert stored["error"] is None
+        assert (channel_dir / "fresh.mp4").exists()
+        # Neither max_episodes cleanup nor retention deleted anything.
+        assert self.surviving(channel_dir) == ["a", "b", "c"]
+
+    def test_cleanup_crash_after_download_keeps_job_completed(self, test_server):
+        test_server.queue_worker.stop()
+        job = enqueue_job(test_server.queue, video_id="fresh")
+        with (
+            patch("src.downloader.YouTubeDownloader", StubDownloader),
+            patch(
+                "src.download_queue.cleanup_episodes",
+                side_effect=RuntimeError("disk hiccup"),
+            ),
+        ):
+            self.drain_one(test_server, job)
+        stored = test_server.queue.get(job["id"])
+        assert stored["state"] == "completed"
+        assert stored["attempts"] == 1

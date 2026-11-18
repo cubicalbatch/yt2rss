@@ -58,7 +58,6 @@ try:
         collect_events,
         dispatch_events,
         health_summary,
-        load_health,
         load_notification_settings,
         record_refresh,
         remove_channel_health,
@@ -67,6 +66,7 @@ try:
     from .rss_generator import RSSGenerator
     from .storage import (
         GB,
+        PinsUnavailableError,
         admission_error,
         apply_retention,
         effective_channel_storage,
@@ -77,7 +77,7 @@ try:
         load_storage_settings,
         load_tombstones,
         measure_media_usage,
-        pinned_ids,
+        pins_for_deletion,
         record_tombstone,
         remove_channel_pins,
         remove_channel_tombstones,
@@ -90,6 +90,7 @@ try:
     from .utils import (
         MEDIA_EXTENSIONS,
         MediaLock,
+        StateFileError,
         atomic_write_text,
         cleanup_episodes,
         contained_path,
@@ -123,7 +124,6 @@ except ImportError:
         collect_events,
         dispatch_events,
         health_summary,
-        load_health,
         load_notification_settings,
         record_refresh,
         remove_channel_health,
@@ -132,6 +132,7 @@ except ImportError:
     from rss_generator import RSSGenerator
     from storage import (
         GB,
+        PinsUnavailableError,
         admission_error,
         apply_retention,
         effective_channel_storage,
@@ -142,7 +143,7 @@ except ImportError:
         load_storage_settings,
         load_tombstones,
         measure_media_usage,
-        pinned_ids,
+        pins_for_deletion,
         record_tombstone,
         remove_channel_pins,
         remove_channel_tombstones,
@@ -155,6 +156,7 @@ except ImportError:
     from utils import (
         MEDIA_EXTENSIONS,
         MediaLock,
+        StateFileError,
         atomic_write_text,
         cleanup_episodes,
         contained_path,
@@ -176,6 +178,15 @@ OVERDUE_REFRESH_STAGGER_SECONDS = 30
 # A scheduled refresh that finds the worker busy is retried after this delay.
 REFRESH_RETRY_DELAY_SECONDS = 300
 SCHEDULER_MISFIRE_GRACE_SECONDS = 3600
+# API errors for state files that exist but cannot be used; never "empty".
+TOMBSTONES_UNAVAILABLE_ERROR = (
+    "tombstones.json cannot be read; remembered deletions are unavailable "
+    "until it is readable again (check its permissions and the disk)"
+)
+PINS_UNAVAILABLE_ERROR = (
+    "pins.json is corrupt or unreadable; repair or remove it before changing "
+    "pins (episode cleanup and retention are paused until then)"
+)
 
 
 def parse_utc_timestamp(value: Any) -> datetime | None:
@@ -671,7 +682,9 @@ class YouTubePodcastServer:
         episodes stored on disk; files are never deleted here. Downloaded
         metadata keeps yt-dlp's live markers, so ``skip_livestreams`` also
         applies to stored episodes; episodes downloaded before those
-        markers were recorded stay visible.
+        markers were recorded stay visible. An unreadable
+        ``tombstones.json`` only logs a warning: tombstoned episodes have
+        no files left to show anyway.
 
         Args:
             channel_name: Sanitized channel identifier.
@@ -683,7 +696,11 @@ class YouTubePodcastServer:
         generator = RSSGenerator()
         episodes = generator.scan_channel_videos(self.videos_dir / channel_name)
         filters = load_episode_filters(channel_config)
-        deleted = tombstoned_ids(self.config_dir, channel_name)
+        try:
+            deleted = tombstoned_ids(self.config_dir, channel_name)
+        except StateFileError as error:
+            self.logger.warning(f"Listing {channel_name} without tombstones: {error}")
+            deleted = set()
         visible = []
         for episode in episodes:
             if str(episode.get("id") or "") in deleted:
@@ -842,7 +859,8 @@ class YouTubePodcastServer:
 
         The ``health.json`` history (successes and failures) is
         authoritative; ``refresh_timestamps.json`` covers channels without
-        usable history, such as data written before health tracking.
+        usable history, such as data written before health tracking or
+        while ``health.json`` cannot be read.
 
         Returns:
             Aware UTC timestamps keyed by channel name.
@@ -852,7 +870,7 @@ class YouTubePodcastServer:
             timestamp = parse_utc_timestamp(value)
             if timestamp is not None:
                 attempts[str(name)] = timestamp
-        for name, state in load_health(self.config_dir)["channels"].items():
+        for name, state in health_summary(self.config_dir)["channels"].items():
             attempt = latest_history_attempt(state.get("history"))
             if attempt is not None:
                 attempts[name] = attempt
@@ -1614,15 +1632,18 @@ class YouTubePodcastServer:
         """Run a reserved refresh for one channel."""
         self._run_refresh(channel_name)
 
-    def _cleanup_old_episodes(self, channel_name: str, max_episodes: int):
-        """Remove completed episodes exceeding the configured limit."""
+    def _cleanup_old_episodes(self, channel_name: str, max_episodes: int) -> None:
+        """Remove completed episodes exceeding the configured limit.
+
+        Skipped (with an actionable error) while ``pins.json`` is unusable.
+        """
+        pinned = pins_for_deletion(
+            self.config_dir, channel_name, self.logger, "cleanup"
+        )
+        if pinned is None:
+            return
         try:
-            cleanup_episodes(
-                self.videos_dir,
-                channel_name,
-                max_episodes,
-                pinned=pinned_ids(self.config_dir, channel_name),
-            )
+            cleanup_episodes(self.videos_dir, channel_name, max_episodes, pinned=pinned)
         except Exception as error:
             self.logger.error(f"Error cleaning up {channel_name}: {error}")
 
@@ -1630,6 +1651,8 @@ class YouTubePodcastServer:
         self, channel: dict[str, Any], global_config: dict[str, Any]
     ) -> int:
         """Delete episodes past the channel's effective retention window.
+
+        Skipped (with an actionable error) while ``pins.json`` is unusable.
 
         Args:
             channel: Channel configuration entry.
@@ -1644,7 +1667,11 @@ class YouTubePodcastServer:
             )
             if effective["retention_days"] <= 0:
                 return 0
-            pinned = pinned_ids(self.config_dir, channel["name"])
+            pinned = pins_for_deletion(
+                self.config_dir, channel["name"], self.logger, "retention"
+            )
+            if pinned is None:
+                return 0
             removed = apply_retention(
                 self.videos_dir,
                 channel["name"],
@@ -2075,7 +2102,7 @@ class YouTubePodcastServer:
         try:
             config = self._load_channel_config()
             settings = load_storage_settings(config)
-            pins = load_pins(self.config_dir)
+            pins, pins_error = self._pins_for_display()
             usage = measure_media_usage(self.videos_dir)
             free_bytes = free_disk_bytes(self.videos_dir)
 
@@ -2125,6 +2152,7 @@ class YouTubePodcastServer:
                     "accounting": (
                         "media files only; thumbnails and metadata excluded"
                     ),
+                    "pins_error": pins_error,
                 }
             ), 200
         except OSError as e:
@@ -2133,6 +2161,19 @@ class YouTubePodcastServer:
         except Exception as e:
             self.logger.error(f"Error getting storage info: {e}")
             return jsonify({"error": "Failed to get storage info"}), 500
+
+    def _pins_for_display(self) -> tuple[dict[str, list[str]], str | None]:
+        """Load pins for read-only views without failing the request.
+
+        Returns:
+            ``(pins, error)``: all pins and None, or no pins and an
+            actionable message when ``pins.json`` is unusable.
+        """
+        try:
+            return load_pins(self.config_dir), None
+        except PinsUnavailableError as error:
+            self.logger.warning(f"Showing no pins: {error}")
+            return {}, PINS_UNAVAILABLE_ERROR
 
     def _handle_get_storage_config(self):
         """Return the effective global storage settings."""
@@ -2194,6 +2235,9 @@ class YouTubePodcastServer:
             if not (channel_dir / f"{episode_id}.json").is_file() or not has_media:
                 return jsonify({"error": "Episode not found"}), 404
 
+            # Report an unusable pins.json clearly; the writer below would
+            # only refuse to overwrite it.
+            load_pins(self.config_dir)
             if not set_episode_pinned(
                 self.config_dir, channel_name, episode_id, pinned
             ):
@@ -2205,6 +2249,9 @@ class YouTubePodcastServer:
                     "pinned": pinned,
                 }
             ), 200
+        except PinsUnavailableError as e:
+            self.logger.error(f"Not toggling pin for {channel_name}/{episode_id}: {e}")
+            return jsonify({"error": PINS_UNAVAILABLE_ERROR}), 500
         except Exception as e:
             self.logger.error(
                 f"Error toggling pin for {channel_name}/{episode_id}: {e}"
@@ -2663,7 +2710,9 @@ class YouTubePodcastServer:
         try:
             if not self._channel_exists(channel_name):
                 return jsonify({"error": "Channel not found"}), 404
-            tombstones = load_tombstones(self.config_dir).get(channel_name, {})
+            tombstones = load_tombstones(self.config_dir, quarantine=False).get(
+                channel_name, {}
+            )
             return jsonify(
                 {
                     "channel": channel_name,
@@ -2671,9 +2720,16 @@ class YouTubePodcastServer:
                     "total_count": len(tombstones),
                 }
             ), 200
+        except StateFileError as e:
+            return self._tombstones_unavailable(e)
         except Exception as e:
             self.logger.error(f"Error loading tombstones for {channel_name}: {e}")
             return jsonify({"error": "Internal server error"}), 500
+
+    def _tombstones_unavailable(self, error: StateFileError):
+        """Log an unreadable tombstones.json and build the clear 500 reply."""
+        self.logger.error(f"Tombstones unavailable: {error}")
+        return jsonify({"error": TOMBSTONES_UNAVAILABLE_ERROR}), 500
 
     @config_transaction
     def _handle_clear_tombstones(self, channel_name: str):
@@ -2681,6 +2737,9 @@ class YouTubePodcastServer:
         try:
             if not self._channel_exists(channel_name):
                 return jsonify({"error": "Channel not found"}), 404
+            # Fail clearly on an unreadable file; the writer would only
+            # refuse to overwrite it and report nothing removed.
+            load_tombstones(self.config_dir)
             removed = remove_channel_tombstones(self.config_dir, channel_name)
             self.logger.info(
                 f"Forgot {removed} tombstone(s) for channel: {channel_name}"
@@ -2691,6 +2750,8 @@ class YouTubePodcastServer:
                     "removed": removed,
                 }
             ), 200
+        except StateFileError as e:
+            return self._tombstones_unavailable(e)
         except Exception as e:
             self.logger.error(f"Error clearing tombstones for {channel_name}: {e}")
             return jsonify({"error": "Internal server error"}), 500
@@ -2701,12 +2762,17 @@ class YouTubePodcastServer:
         try:
             if not self._channel_exists(channel_name):
                 return jsonify({"error": "Channel not found"}), 404
-            if not remove_episode_tombstone(self.config_dir, channel_name, episode_id):
+            tombstones = load_tombstones(self.config_dir).get(channel_name, {})
+            if episode_id not in tombstones:
                 return jsonify({"error": "Tombstone not found"}), 404
+            if not remove_episode_tombstone(self.config_dir, channel_name, episode_id):
+                return jsonify({"error": "Failed to update tombstones"}), 500
             self.logger.info(f"Forgot tombstone for {channel_name}/{episode_id}")
             return jsonify(
                 {"message": "Tombstone removed", "episode_id": episode_id}
             ), 200
+        except StateFileError as e:
+            return self._tombstones_unavailable(e)
         except Exception as e:
             self.logger.error(
                 f"Error forgetting tombstone {channel_name}/{episode_id}: {e}"
@@ -2736,7 +2802,8 @@ class YouTubePodcastServer:
             # Filtered and tombstoned episodes stay hidden, consistent
             # with the RSS feed and the episode counts.
             episodes_data = self._visible_episodes(channel_name, channel_config)
-            pinned = pinned_ids(self.config_dir, channel_name)
+            pins, _ = self._pins_for_display()
+            pinned = set(pins.get(channel_name, ()))
 
             # Format episodes for the frontend
             episodes = []
@@ -3112,7 +3179,9 @@ class YouTubePodcastServer:
 
         The deletion is recorded as a tombstone so discovery and queue
         execution never re-download this episode; an explicit redownload
-        clears the tombstone again.
+        clears the tombstone again. Nothing is deleted while
+        ``tombstones.json`` cannot be read, because the deletion could not
+        be remembered.
         """
         try:
             # Validate channel exists
@@ -3124,6 +3193,10 @@ class YouTubePodcastServer:
             json_file = channel_dir / f"{episode_id}.json"
             if not json_file.exists():
                 return jsonify({"error": "Episode not found"}), 404
+
+            # Fail before deleting anything when the deletion could not be
+            # remembered; it would otherwise be downloaded again later.
+            load_tombstones(self.config_dir, quarantine=False)
 
             # Remember the title for the tombstone record before the
             # metadata file disappears.
@@ -3188,6 +3261,8 @@ class YouTubePodcastServer:
                 }
             ), 200
 
+        except StateFileError as e:
+            return self._tombstones_unavailable(e)
         except Exception as e:
             self.logger.error(
                 f"Error deleting episode {channel_name}/{episode_id}: {e}"
@@ -3221,11 +3296,13 @@ class YouTubePodcastServer:
             channel_dir = self.videos_dir / channel_name
             json_file = channel_dir / f"{episode_id}.json"
 
-            tombstone = (
-                load_tombstones(self.config_dir).get(channel_name, {}).get(episode_id)
-            )
             metadata: dict[str, Any]
             if not json_file.exists():
+                tombstone = (
+                    load_tombstones(self.config_dir, quarantine=False)
+                    .get(channel_name, {})
+                    .get(episode_id)
+                )
                 if tombstone is None:
                     return jsonify({"error": "Episode not found"}), 404
                 metadata = {"title": tombstone.get("title") or episode_id}
@@ -3314,6 +3391,8 @@ class YouTubePodcastServer:
                 }
             ), 200
 
+        except StateFileError as e:
+            return self._tombstones_unavailable(e)
         except Exception as e:
             self.logger.error(
                 f"Error redownloading episode {channel_name}/{episode_id}: {e}"
