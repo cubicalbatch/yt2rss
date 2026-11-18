@@ -110,6 +110,15 @@ Refresh intervals can be fractional (for example, `0.5` for 30 minutes), up to
 before saving them. Configuration files are replaced atomically; a malformed
 existing file must be repaired before configuration changes can be saved.
 
+Scheduled refreshes are anchored to each channel's last refresh attempt
+(successful or failed, from `health.json`, falling back to
+`refresh_timestamps.json`): the next run is that attempt plus the channel's
+interval. Schedules therefore survive restarts and edits to other channels,
+and changing a channel's interval reschedules it from its last attempt.
+Channels already overdue when the server starts run shortly after startup,
+staggered so they do not all start at once; channels without any recorded
+attempt (for example after upgrading) wait one full interval.
+
 ### Episode Filters
 
 Every filter is optional; channels without filter keys behave exactly as
@@ -141,7 +150,11 @@ markers, so `skip_livestreams` also hides stored livestreams; episodes
 downloaded before those markers were recorded stay visible. Every skip is
 logged with the matched rule in the refresh logs.
 
-Manual and scheduled refreshes share one worker slot. Purge, delete, and
+Manual and scheduled refreshes share one worker slot. A manual refresh returns
+HTTP 409 while another refresh or media operation is running; a scheduled
+refresh that finds the worker busy (another refresh, a download, or a
+purge/delete/redownload in progress) is not dropped but retried after 5
+minutes, repeating until it can run. Purge, delete, and
 redownload requests return HTTP 409 while a media operation is running. A failed
 redownload preserves the existing episode. Cleanup counts completed episodes and
 removes all supported media formats belonging to expired episodes.

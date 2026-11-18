@@ -17,7 +17,9 @@ from urllib.parse import quote, urlsplit
 import yaml
 import yt_dlp
 from apscheduler.executors.pool import ThreadPoolExecutor
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from flask import (
     Flask,
@@ -56,6 +58,7 @@ try:
         collect_events,
         dispatch_events,
         health_summary,
+        load_health,
         load_notification_settings,
         record_refresh,
         remove_channel_health,
@@ -120,6 +123,7 @@ except ImportError:
         collect_events,
         dispatch_events,
         health_summary,
+        load_health,
         load_notification_settings,
         record_refresh,
         remove_channel_health,
@@ -162,6 +166,143 @@ except ImportError:
         setup_logging,
         validate_channel_settings,
     )
+
+REFRESH_JOB_PREFIX = "channel_refresh_"
+RETRY_JOB_PREFIX = "channel_retry_"
+# Overdue channels run shortly after startup, one stagger step apart, so a
+# restart never fires every overdue refresh at the same instant.
+OVERDUE_REFRESH_DELAY_SECONDS = 60
+OVERDUE_REFRESH_STAGGER_SECONDS = 30
+# A scheduled refresh that finds the worker busy is retried after this delay.
+REFRESH_RETRY_DELAY_SECONDS = 300
+SCHEDULER_MISFIRE_GRACE_SECONDS = 3600
+
+
+def parse_utc_timestamp(value: Any) -> datetime | None:
+    """Parse a stored ISO timestamp into an aware UTC datetime.
+
+    Args:
+        value: Raw value read from a JSON state file.
+
+    Returns:
+        The timestamp in UTC (naive values are assumed to be UTC), or
+        ``None`` when the value is missing or malformed.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    except (ValueError, OverflowError):
+        return None
+
+
+def latest_history_attempt(history: Any) -> datetime | None:
+    """Return the newest parseable ``at`` timestamp of a health history.
+
+    Args:
+        history: A channel's ``history`` list from ``health.json``; both
+            successful and failed refreshes count as attempts.
+
+    Returns:
+        The most recent attempt, or ``None`` when no entry has a valid
+        timestamp.
+    """
+    if not isinstance(history, list):
+        return None
+    attempts = [
+        parse_utc_timestamp(entry.get("at"))
+        for entry in history
+        if isinstance(entry, dict)
+    ]
+    return max((attempt for attempt in attempts if attempt), default=None)
+
+
+def refresh_due_time(
+    last_attempt: datetime | None, interval_hours: float, now: datetime
+) -> datetime:
+    """Return when a channel's next refresh is due; it may be in the past.
+
+    Args:
+        last_attempt: The channel's last recorded refresh attempt, if any.
+        interval_hours: The channel's effective refresh interval.
+        now: The current aware time.
+
+    Returns:
+        ``last_attempt + interval``; ``now + interval`` without a record.
+        Attempts recorded in the future (clock skew) count as ``now``.
+    """
+    interval = timedelta(hours=interval_hours)
+    if last_attempt is None:
+        return now + interval
+    return min(last_attempt, now) + interval
+
+
+def job_channel_name(job_id: str) -> str | None:
+    """Return the channel a refresh or retry job belongs to, if any."""
+    for prefix in (REFRESH_JOB_PREFIX, RETRY_JOB_PREFIX):
+        if job_id.startswith(prefix):
+            return job_id[len(prefix) :]
+    return None
+
+
+def overdue_run_time(now: datetime, slot: int) -> datetime:
+    """Return the startup run time for the ``slot``-th overdue channel."""
+    return now + timedelta(
+        seconds=OVERDUE_REFRESH_DELAY_SECONDS + slot * OVERDUE_REFRESH_STAGGER_SECONDS
+    )
+
+
+def current_job_run_time(job: Any, interval_hours: float) -> datetime | None:
+    """Return a live refresh job's next run time if its interval still applies.
+
+    Args:
+        job: The channel's existing APScheduler job, or ``None``.
+        interval_hours: The channel's effective refresh interval.
+
+    Returns:
+        The job's next run time, or ``None`` when there is no job or its
+        interval changed.
+    """
+    if job is None or job.next_run_time is None:
+        return None
+    trigger = job.trigger
+    if not isinstance(trigger, IntervalTrigger):
+        return None
+    if trigger.interval != timedelta(hours=interval_hours):
+        return None
+    return job.next_run_time
+
+
+def next_refresh_run(
+    last_attempt: datetime | None,
+    interval_hours: float,
+    live_run: datetime | None,
+    now: datetime,
+) -> datetime:
+    """Combine persisted and live schedule data into a channel's next run.
+
+    A live job's run time wins when no attempt is recorded yet, and while
+    it is later than the persisted due time (the job fired but its refresh
+    is still running or waiting on a busy retry), so rescheduling after a
+    configuration change neither postpones nor re-fires such a channel.
+
+    Args:
+        last_attempt: The channel's last recorded refresh attempt, if any.
+        interval_hours: The channel's effective refresh interval.
+        live_run: The existing job's run time from ``current_job_run_time``.
+        now: The current aware time.
+
+    Returns:
+        The next run time; it is in the past when the channel is overdue.
+    """
+    if live_run is None:
+        return refresh_due_time(last_attempt, interval_hours, now)
+    if last_attempt is None:
+        return live_run
+    return max(refresh_due_time(last_attempt, interval_hours, now), live_run)
 
 
 def config_transaction(method: Callable[..., Any]) -> Callable[..., Any]:
@@ -494,17 +635,18 @@ class YouTubePodcastServer:
         """Clear the recent logs."""
         self.recent_logs = []
 
-    def _load_refresh_timestamps(self):
-        """Load refresh timestamps from file"""
+    def _load_refresh_timestamps(self) -> dict[str, Any]:
+        """Load refresh timestamps; unreadable or malformed files read as empty."""
         timestamps_file = self.config_dir / "refresh_timestamps.json"
         if not timestamps_file.exists():
             return {}
         try:
             with open(timestamps_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError) as e:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
             self.logger.error(f"Error loading refresh timestamps: {e}")
             return {}
+        return data if isinstance(data, dict) else {}
 
     def _format_timestamp(self, iso_timestamp: str) -> str:
         """Format ISO timestamp for display - returns raw ISO for client-side formatting"""
@@ -594,75 +736,157 @@ class YouTubePodcastServer:
             ) from e
 
     def _setup_scheduler(self):
-        """Setup per-channel automatic refresh scheduler based on config."""
+        """Set up per-channel refresh jobs plus maintenance and health jobs.
+
+        Each channel's next run is anchored to its last recorded refresh
+        attempt, so restarts and edits to other channels leave existing
+        schedules unchanged. Jobs of deleted channels, including pending
+        busy retries, are removed.
+        """
         try:
             config = self._load_channel_config()
             channels = config.get("channels", [])
             default_interval = config.get("default_interval_hours", 24)
-
-            # Remove all existing channel jobs
-            for job in self.scheduler.get_jobs():
-                if job.id.startswith("channel_refresh_"):
-                    self.scheduler.remove_job(job.id)
-
-            # Add per-channel jobs
-            for channel in channels:
-                channel_name = channel.get("name")
-                if not channel_name:
-                    continue
-
-                # Get channel-specific interval or use default
-                interval_hours = channel.get("refresh_interval_hours", default_interval)
-
-                job_id = f"channel_refresh_{channel_name}"
-
-                # Add job for this channel
-                self.scheduler.add_job(
-                    func=self._scheduled_channel_refresh,
-                    args=[channel_name],
-                    trigger=IntervalTrigger(hours=interval_hours),
-                    id=job_id,
-                    name=f"Auto Refresh: {channel.get('display_name', channel_name)}",
-                    replace_existing=True,
-                    misfire_grace_time=3600,  # Allow jobs to run up to 1 hour late
-                    coalesce=True,  # Collapse multiple missed executions into one
-                    max_instances=1,  # Only one instance of each job at a time
-                )
-
-                self.logger.info(
-                    f"Scheduled refresh for '{channel_name}' every {interval_hours} hours"
-                )
-
-            # Storage maintenance applies retention cleanup once at startup
-            # and then once per day.
-            self.scheduler.add_job(
-                func=self._run_storage_maintenance,
-                trigger=IntervalTrigger(days=1),
-                id="storage_maintenance",
-                name="Storage maintenance (retention)",
-                replace_existing=True,
-                misfire_grace_time=3600,
-                coalesce=True,
-                max_instances=1,
-                next_run_time=datetime.now(),
-            )
-
-            # Health evaluation runs hourly: repeated-failure and low-space
-            # notifications are cooldown-limited, so this is cheap and does
-            # not fire immediately on startup.
-            self.scheduler.add_job(
-                func=self._run_health_check,
-                trigger=IntervalTrigger(hours=1),
-                id="health_check",
-                name="Health check and notifications",
-                replace_existing=True,
-                misfire_grace_time=3600,
-                coalesce=True,
-                max_instances=1,
-            )
-
+            channel_names = {str(ch.get("name")) for ch in channels if ch.get("name")}
+            current_jobs = self._remove_stale_channel_jobs(channel_names)
+            self._schedule_channel_refreshes(channels, default_interval, current_jobs)
+            self._schedule_maintenance_jobs()
         except Exception as e:
             self.logger.error(f"Error setting up scheduler: {e}")
+
+    def _remove_stale_channel_jobs(self, channel_names: set[str]) -> dict[str, Any]:
+        """Remove refresh and retry jobs whose channel no longer exists.
+
+        Args:
+            channel_names: Names of the currently configured channels.
+
+        Returns:
+            The surviving regular refresh jobs keyed by job id.
+        """
+        current: dict[str, Any] = {}
+        for job in self.scheduler.get_jobs():
+            channel_name = job_channel_name(job.id)
+            if channel_name is None:
+                continue
+            if channel_name not in channel_names:
+                try:
+                    self.scheduler.remove_job(job.id)
+                except JobLookupError:
+                    pass  # A one-off retry fired and was removed meanwhile.
+            elif job.id.startswith(REFRESH_JOB_PREFIX):
+                current[job.id] = job
+        return current
+
+    def _schedule_channel_refreshes(
+        self,
+        channels: list[dict[str, Any]],
+        default_interval: float,
+        current_jobs: dict[str, Any],
+    ) -> None:
+        """Create or replace each channel's interval refresh job.
+
+        Args:
+            channels: Configured channel entries.
+            default_interval: Interval for channels without their own.
+            current_jobs: Existing refresh jobs keyed by job id.
+        """
+        now = datetime.now(UTC)
+        last_attempts = self._last_refresh_attempts()
+        overdue_slot = 0
+        for channel in channels:
+            channel_name = channel.get("name")
+            if not channel_name:
+                continue
+            interval_hours = channel.get("refresh_interval_hours", default_interval)
+            job_id = f"{REFRESH_JOB_PREFIX}{channel_name}"
+            live_run = current_job_run_time(current_jobs.get(job_id), interval_hours)
+            next_run = next_refresh_run(
+                last_attempts.get(channel_name), interval_hours, live_run, now
+            )
+            if next_run <= now:
+                next_run = overdue_run_time(now, overdue_slot)
+                overdue_slot += 1
+            self._add_channel_refresh_job(channel, interval_hours, next_run)
+
+    def _add_channel_refresh_job(
+        self, channel: dict[str, Any], interval_hours: float, next_run: datetime
+    ) -> None:
+        """Add one channel's interval refresh job starting at ``next_run``.
+
+        Args:
+            channel: The channel's configuration entry.
+            interval_hours: Hours between refreshes after the first run.
+            next_run: Aware time of the first run.
+        """
+        channel_name = channel["name"]
+        self.scheduler.add_job(
+            func=self._scheduled_channel_refresh,
+            args=[channel_name],
+            # APScheduler accepts fractional hours; its untyped default is int.
+            trigger=IntervalTrigger(hours=cast(Any, interval_hours)),
+            id=f"{REFRESH_JOB_PREFIX}{channel_name}",
+            name=f"Auto Refresh: {channel.get('display_name', channel_name)}",
+            replace_existing=True,
+            misfire_grace_time=SCHEDULER_MISFIRE_GRACE_SECONDS,
+            coalesce=True,  # Collapse multiple missed executions into one
+            max_instances=1,  # Only one instance of each job at a time
+            next_run_time=next_run,
+        )
+        self.logger.info(
+            f"Scheduled refresh for '{channel_name}' every {interval_hours} hours; "
+            f"next run {next_run.isoformat()}"
+        )
+
+    def _last_refresh_attempts(self) -> dict[str, datetime]:
+        """Map channels to their most recent recorded refresh attempt.
+
+        The ``health.json`` history (successes and failures) is
+        authoritative; ``refresh_timestamps.json`` covers channels without
+        usable history, such as data written before health tracking.
+
+        Returns:
+            Aware UTC timestamps keyed by channel name.
+        """
+        attempts: dict[str, datetime] = {}
+        for name, value in self._load_refresh_timestamps().items():
+            timestamp = parse_utc_timestamp(value)
+            if timestamp is not None:
+                attempts[str(name)] = timestamp
+        for name, state in load_health(self.config_dir)["channels"].items():
+            attempt = latest_history_attempt(state.get("history"))
+            if attempt is not None:
+                attempts[name] = attempt
+        return attempts
+
+    def _schedule_maintenance_jobs(self) -> None:
+        """Schedule daily storage maintenance and the hourly health check."""
+        # Storage maintenance applies retention cleanup once at startup
+        # and then once per day.
+        self.scheduler.add_job(
+            func=self._run_storage_maintenance,
+            trigger=IntervalTrigger(days=1),
+            id="storage_maintenance",
+            name="Storage maintenance (retention)",
+            replace_existing=True,
+            misfire_grace_time=SCHEDULER_MISFIRE_GRACE_SECONDS,
+            coalesce=True,
+            max_instances=1,
+            next_run_time=datetime.now(),
+        )
+
+        # Health evaluation runs hourly: repeated-failure and low-space
+        # notifications are cooldown-limited, so this is cheap and does
+        # not fire immediately on startup.
+        self.scheduler.add_job(
+            func=self._run_health_check,
+            trigger=IntervalTrigger(hours=1),
+            id="health_check",
+            name="Health check and notifications",
+            replace_existing=True,
+            misfire_grace_time=SCHEDULER_MISFIRE_GRACE_SECONDS,
+            coalesce=True,
+            max_instances=1,
+        )
 
     @config_transaction
     def _restart_scheduler(self, new_default_interval_hours: float):
@@ -1082,9 +1306,62 @@ class YouTubePodcastServer:
             self._media_lock.release()
 
     def _scheduled_channel_refresh(self, channel_name: str) -> None:
-        """Use the same admission control for scheduled and manual refreshes."""
+        """Run a scheduled (or retried) refresh for one channel.
+
+        Uses the same admission control as manual refreshes. When the
+        refresh cannot be reserved, a one-off retry is scheduled instead of
+        dropping the run; channels no longer configured are ignored.
+
+        Args:
+            channel_name: Sanitized channel identifier.
+        """
+        if not self._scheduled_channel_configured(channel_name):
+            return
         if self._begin_refresh():
             self._run_single_channel_refresh(channel_name)
+        else:
+            self._schedule_refresh_retry(channel_name)
+
+    def _scheduled_channel_configured(self, channel_name: str) -> bool:
+        """Return whether a scheduled refresh still targets a configured channel."""
+        try:
+            exists = self._channel_exists(channel_name)
+        except ValueError as error:
+            self.logger.error(
+                f"Scheduled refresh for '{channel_name}' skipped: {error}"
+            )
+            return False
+        if not exists:
+            self.logger.info(
+                f"Scheduled refresh for '{channel_name}' skipped; channel was removed"
+            )
+        return exists
+
+    def _schedule_refresh_retry(self, channel_name: str) -> None:
+        """Retry a busy scheduled refresh after ``REFRESH_RETRY_DELAY_SECONDS``.
+
+        The retry job id is per channel and replaces any pending retry, so
+        repeated busy attempts never pile up.
+
+        Args:
+            channel_name: Sanitized channel identifier.
+        """
+        run_at = datetime.now(UTC) + timedelta(seconds=REFRESH_RETRY_DELAY_SECONDS)
+        self.scheduler.add_job(
+            func=self._scheduled_channel_refresh,
+            args=[channel_name],
+            trigger=DateTrigger(run_date=run_at),
+            id=f"{RETRY_JOB_PREFIX}{channel_name}",
+            name=f"Refresh retry: {channel_name}",
+            replace_existing=True,
+            misfire_grace_time=SCHEDULER_MISFIRE_GRACE_SECONDS,
+            coalesce=True,
+            max_instances=1,
+        )
+        self.logger.info(
+            f"Scheduled refresh for '{channel_name}' deferred: another refresh "
+            f"or media operation is running; retrying at {run_at.isoformat()}"
+        )
 
     def _run_refresh(self, channel_name: str | None = None) -> None:
         """Refresh selected channels by queueing their missing downloads.
@@ -1726,10 +2003,10 @@ class YouTubePodcastServer:
             # Get next scheduled runs for all channels
             next_runs = []
             for job in self.scheduler.get_jobs():
-                if job.id.startswith("channel_refresh_") and job.next_run_time:
+                if job.id.startswith(REFRESH_JOB_PREFIX) and job.next_run_time:
                     next_runs.append(
                         {
-                            "channel": job.id.replace("channel_refresh_", ""),
+                            "channel": job.id.replace(REFRESH_JOB_PREFIX, ""),
                             "next_run": job.next_run_time.isoformat(),
                             "name": job.name,
                         }
@@ -3207,7 +3484,7 @@ class YouTubePodcastServer:
         channel_jobs = [
             job
             for job in self.scheduler.get_jobs()
-            if job.id.startswith("channel_refresh_")
+            if job.id.startswith(REFRESH_JOB_PREFIX)
         ]
         if channel_jobs:
             self.logger.info(
