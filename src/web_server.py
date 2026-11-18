@@ -109,6 +109,7 @@ try:
         sanitize_channel_name,
         setup_logging,
         validate_channel_settings,
+        yt_dlp_proxy_opts,
     )
 except ImportError:
     from auth import (
@@ -182,6 +183,7 @@ except ImportError:
         sanitize_channel_name,
         setup_logging,
         validate_channel_settings,
+        yt_dlp_proxy_opts,
     )
 
 REFRESH_JOB_PREFIX = "channel_refresh_"
@@ -670,26 +672,6 @@ class YouTubePodcastServer:
 
         session.clear()
         return redirect(url_for("login"))
-
-    def _get_proxy_opts(self) -> dict:
-        """Get proxy configuration from environment variables.
-
-        Returns a dictionary with proxy settings for yt-dlp if YT_DLP_PROXY is set.
-        Supports SOCKS5, HTTP, and HTTPS proxies.
-
-        Example formats:
-        - socks5://host:port
-        - socks5://user:pass@host:port
-        - http://host:port
-        - https://host:port
-        """
-        proxy_url = os.getenv("YT_DLP_PROXY")
-        if proxy_url:
-            self.logger.info(
-                f"🔐 Using proxy: {proxy_url.split('@')[-1]}"
-            )  # Don't log credentials
-            return {"proxy": proxy_url}
-        return {}
 
     def _add_log_message(self, message: str) -> None:
         """Append a timestamped message to the bounded UI log buffer.
@@ -2411,7 +2393,7 @@ class YouTubePodcastServer:
                 "no_warnings": True,
                 "extract_flat": True,
                 "playlistend": 1,  # Only get first video to verify channel exists
-                **self._get_proxy_opts(),
+                **yt_dlp_proxy_opts(self.logger),
             }
 
             with yt_dlp.YoutubeDL(cast(Any, ydl_opts)) as ydl:

@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -31,6 +30,7 @@ try:
         safe_component,
         save_json_file,
         validate_channel_settings,
+        yt_dlp_proxy_opts,
     )
 except ImportError:
     from download_queue import ConfigUnavailableError, DownloadCancelled
@@ -51,6 +51,7 @@ except ImportError:
         safe_component,
         save_json_file,
         validate_channel_settings,
+        yt_dlp_proxy_opts,
     )
 
 
@@ -88,26 +89,6 @@ class YouTubeDownloader:
         self.rss_generator.refresh_timestamps_file = (
             Path(config_path).resolve().parent / "refresh_timestamps.json"
         )
-
-    def _get_proxy_opts(self) -> dict[str, str]:
-        """Get proxy configuration from environment variables.
-
-        Returns a dictionary with proxy settings for yt-dlp if YT_DLP_PROXY is set.
-        Supports SOCKS5, HTTP, and HTTPS proxies.
-
-        Example formats:
-        - socks5://host:port
-        - socks5://user:pass@host:port
-        - http://host:port
-        - https://host:port
-        """
-        proxy_url = os.getenv("YT_DLP_PROXY")
-        if proxy_url:
-            self.logger.info(
-                f"🔐 Using proxy: {proxy_url.split('@')[-1]}"
-            )  # Don't log credentials
-            return {"proxy": proxy_url}
-        return {}
 
     def load_config(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Load channel configuration, treating an unusable file as empty.
@@ -170,7 +151,7 @@ class YouTubeDownloader:
             "no_warnings": True,
             "extract_flat": True,
             "playlist_items": f"1:{max_episodes}",
-            **self._get_proxy_opts(),
+            **yt_dlp_proxy_opts(self.logger),
         }
 
         try:
@@ -218,7 +199,7 @@ class YouTubeDownloader:
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
-            **self._get_proxy_opts(),
+            **yt_dlp_proxy_opts(self.logger),
         }
 
         try:
@@ -357,7 +338,7 @@ class YouTubeDownloader:
             "noplaylist": True,
             "socket_timeout": 30,
             "merge_output_format": "mp4",
-            **self._get_proxy_opts(),
+            **yt_dlp_proxy_opts(self.logger),
         }
         if progress_hook is not None:
             ydl_opts["progress_hooks"] = [progress_hook]

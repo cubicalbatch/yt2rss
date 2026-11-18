@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple, TextIO
+from urllib.parse import urlsplit
 
 try:
     import fcntl
@@ -53,6 +54,12 @@ SPONSORBLOCK_CATEGORIES = {
     "music_offtopic",
     "filler",
 }
+# Optional proxy URL applied to every yt-dlp call (see the README).
+YT_DLP_PROXY_ENV = "YT_DLP_PROXY"
+# Proxy schemes yt-dlp supports; any other scheme is never echoed to logs.
+PROXY_SCHEMES = frozenset({"http", "https", "socks4", "socks4a", "socks5", "socks5h"})
+# Logged instead of a proxy URL that cannot be reduced to scheme://host[:port].
+PROXY_LOG_PLACEHOLDER = "<configured proxy>"
 
 
 class MediaLock:
@@ -850,6 +857,80 @@ def cleanup_episodes(
     logger = logging.getLogger(__name__)
     for episode in deletable[:-max_episodes]:
         delete_episode_files(channel_dir, episode.episode_id, logger)
+
+
+# Proxy values already announced in this process (see ``yt_dlp_proxy_opts``).
+_announced_proxies: set[str] = set()
+_announced_proxies_guard = threading.Lock()
+
+
+def redact_proxy_url(proxy_url: str) -> str:
+    """Reduce a proxy URL to ``scheme://host[:port]`` for logging.
+
+    Userinfo, path, query and fragment are always dropped. The placeholder
+    is returned when the value does not parse, has no hostname, uses a
+    scheme yt-dlp does not support, or has an ``@`` after the host (an
+    unescaped ``/``, ``?`` or ``#`` in credentials pushes them there), so
+    credentials can never reach the logs.
+
+    Args:
+        proxy_url: The configured proxy URL.
+
+    Returns:
+        The redacted proxy address, or :data:`PROXY_LOG_PLACEHOLDER`.
+    """
+    try:
+        parts = urlsplit(proxy_url)
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        return PROXY_LOG_PLACEHOLDER
+    trailing = parts.path + parts.query + parts.fragment
+    if parts.scheme not in PROXY_SCHEMES or not hostname or "@" in trailing:
+        return PROXY_LOG_PLACEHOLDER
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    address = f"{parts.scheme}://{host}"
+    return address if port is None else f"{address}:{port}"
+
+
+def _claim_proxy_announcement(proxy_url: str) -> bool:
+    """Record ``proxy_url`` as announced, reporting whether it was new.
+
+    Args:
+        proxy_url: The configured proxy URL.
+
+    Returns:
+        True for exactly one caller per distinct value in this process.
+    """
+    with _announced_proxies_guard:
+        if proxy_url in _announced_proxies:
+            return False
+        _announced_proxies.add(proxy_url)
+        return True
+
+
+def yt_dlp_proxy_opts(logger: logging.Logger | None = None) -> dict[str, str]:
+    """Build yt-dlp proxy options from the ``YT_DLP_PROXY`` environment variable.
+
+    The value is passed to yt-dlp unchanged apart from surrounding whitespace.
+    Each distinct value is announced at INFO once per process, redacted by
+    :func:`redact_proxy_url`, so frequent metadata fetches and downloads do
+    not repeat it.
+
+    Args:
+        logger: Logger for the announcement; defaults to this module's logger.
+
+    Returns:
+        ``{"proxy": value}`` when a proxy is configured, otherwise ``{}``.
+    """
+    proxy_url = os.getenv(YT_DLP_PROXY_ENV, "").strip()
+    if not proxy_url:
+        return {}
+    if _claim_proxy_announcement(proxy_url):
+        (logger or logging.getLogger(__name__)).info(
+            f"🔐 Using proxy: {redact_proxy_url(proxy_url)}"
+        )
+    return {"proxy": proxy_url}
 
 
 def setup_logging() -> logging.Logger:
