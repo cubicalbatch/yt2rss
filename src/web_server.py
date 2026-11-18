@@ -7,6 +7,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from functools import wraps
@@ -398,20 +399,26 @@ def exclusive_media_operation(method: Callable[..., Any]) -> Callable[..., Any]:
 class UILogHandler(logging.Handler):
     """Custom logging handler to capture downloader logs for UI display."""
 
-    def __init__(self, server_instance):
+    def __init__(self, server_instance: "YouTubePodcastServer") -> None:
         super().__init__()
         self.server = server_instance
 
-    def emit(self, record):
-        """Emit a log record to the server's log storage."""
+    def emit(self, record: logging.LogRecord) -> None:
+        """Forward an INFO-or-above record's message to the UI log buffer.
+
+        Failures go through :meth:`logging.Handler.handleError`, which
+        reports them on stderr without logging again, so they cannot recurse.
+
+        Args:
+            record: The log record to forward.
+        """
+        if record.levelno < logging.INFO:
+            return
         try:
-            # Capture INFO level messages and above
-            if record.levelno >= logging.INFO:
-                # Only add the message part, not the timestamp and level
-                message_only = record.getMessage()
-                self.server._add_log_message(message_only)
+            # Only add the message part, not the timestamp and level
+            self.server._add_log_message(record.getMessage())
         except Exception:
-            pass  # Avoid infinite recursion on logging errors
+            self.handleError(record)
 
 
 class YouTubePodcastServer:
@@ -438,9 +445,13 @@ class YouTubePodcastServer:
         # Refresh state tracking
         self.refresh_status = {"running": False, "start_time": None, "duration": 0}
 
-        # Log storage for real-time display (keep last 100 messages)
-        self.recent_logs = []
+        # Log storage for real-time display (keep last 100 messages). Queue,
+        # refresh and scheduler threads write it while requests read it.
+        # _clear_logs runs under _state_lock, so _log_lock nests inside
+        # _state_lock and must never be held while acquiring other locks.
         self.max_logs = 100
+        self._log_lock = threading.Lock()
+        self.recent_logs: deque[dict[str, str]] = deque(maxlen=self.max_logs)
 
         # Initialize scheduler with single thread executor
         executors = {
@@ -680,24 +691,31 @@ class YouTubePodcastServer:
             return {"proxy": proxy_url}
         return {}
 
-    def _add_log_message(self, message: str):
-        """Add a log message to the recent logs list for UI display."""
-        timestamp = datetime.now().isoformat()
-        log_entry = {
-            "timestamp": timestamp,
-            "message": message,
-        }
+    def _add_log_message(self, message: str) -> None:
+        """Append a timestamped message to the bounded UI log buffer.
 
-        # Add to recent logs
-        self.recent_logs.append(log_entry)
+        The oldest entry is dropped once ``max_logs`` entries are stored.
 
-        # Keep only the most recent messages
-        if len(self.recent_logs) > self.max_logs:
-            self.recent_logs = self.recent_logs[-self.max_logs :]
+        Args:
+            message: The text to show in the UI log.
+        """
+        log_entry = {"timestamp": datetime.now().isoformat(), "message": message}
+        with self._log_lock:
+            self.recent_logs.append(log_entry)
 
-    def _clear_logs(self):
-        """Clear the recent logs."""
-        self.recent_logs = []
+    def _clear_logs(self) -> None:
+        """Empty the UI log buffer in place."""
+        with self._log_lock:
+            self.recent_logs.clear()
+
+    def _log_snapshot(self) -> list[dict[str, str]]:
+        """Return a copy of the UI log buffer.
+
+        Returns:
+            The stored log entries, oldest first.
+        """
+        with self._log_lock:
+            return list(self.recent_logs)
 
     def _load_refresh_timestamps(self) -> dict[str, Any]:
         """Load refresh timestamps; unreadable or malformed files read as empty."""
@@ -1376,6 +1394,15 @@ class YouTubePodcastServer:
             )
             self._media_lock.release()
 
+    def _refresh_status_snapshot(self) -> dict[str, Any]:
+        """Return a consistent copy of the refresh state.
+
+        Returns:
+            The ``running``, ``start_time`` and ``duration`` fields.
+        """
+        with self._state_lock:
+            return self.refresh_status.copy()
+
     def _scheduled_channel_refresh(self, channel_name: str) -> None:
         """Run a scheduled (or retried) refresh for one channel.
 
@@ -1948,7 +1975,7 @@ class YouTubePodcastServer:
     def _handle_refresh_status(self):
         """Handle refresh status request."""
         try:
-            status = self.refresh_status.copy()
+            status = self._refresh_status_snapshot()
 
             # Calculate current duration if running
             if status["running"] and status["start_time"]:
@@ -1959,7 +1986,7 @@ class YouTubePodcastServer:
                 )
 
             # Add recent logs to the status
-            status["logs"] = self.recent_logs.copy()
+            status["logs"] = self._log_snapshot()
 
             # Queue counts let the UI distinguish discovery (running)
             # from the download queue draining in the background.
@@ -2916,7 +2943,7 @@ class YouTubePodcastServer:
         """Handle single channel refresh request."""
         reserved = False
         try:
-            if self.refresh_status["running"]:
+            if self._refresh_status_snapshot()["running"]:
                 return jsonify({"error": "Refresh already in progress"}), 409
 
             # Validate channel exists

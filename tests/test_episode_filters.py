@@ -76,7 +76,7 @@ def channel_entry(test_server, channel_name: str = "test_channel", **overrides):
 
 def recent_log_text(test_server) -> str:
     """Join the server's UI log messages for assertions."""
-    return "\n".join(entry["message"] for entry in test_server.recent_logs)
+    return "\n".join(entry["message"] for entry in test_server._log_snapshot())
 
 
 def tombstone_backups(config_dir: Path) -> list[Path]:
