@@ -25,7 +25,9 @@ try:
     from .utils import (
         contained_path,
         filter_skip_reason,
+        find_episode_media,
         load_episode_filters,
+        media_extensions_for,
         safe_component,
         save_json_file,
         validate_channel_settings,
@@ -43,7 +45,9 @@ except ImportError:
     from utils import (
         contained_path,
         filter_skip_reason,
+        find_episode_media,
         load_episode_filters,
+        media_extensions_for,
         safe_component,
         save_json_file,
         validate_channel_settings,
@@ -246,16 +250,10 @@ class YouTubeDownloader:
     ) -> bool:
         """Check if video has already been downloaded."""
         channel_dir = contained_path(self.videos_dir, channel_name)
-        extensions = (
-            (".m4a", ".mp3")
-            if format_type == "audio"
-            else (".mp4", ".webm", ".mkv", ".avi")
-        )
-        metadata_file = contained_path(channel_dir, f"{video_id}.json")
-        return metadata_file.is_file() and any(
-            contained_path(channel_dir, f"{video_id}{ext}").is_file()
-            for ext in extensions
-        )
+        if not contained_path(channel_dir, f"{video_id}.json").is_file():
+            return False
+        extensions = media_extensions_for(format_type)
+        return find_episode_media(channel_dir, video_id, extensions) is not None
 
     def is_video_too_new(
         self, video_info: dict[str, Any], download_delay_hours: int
@@ -395,18 +393,8 @@ class YouTubeDownloader:
                 if isinstance(result, int) and result != 0:
                     raise RuntimeError("yt-dlp reported a download failure")
 
-            expected_extensions = (
-                (".m4a", ".mp3")
-                if format_type == "audio"
-                else (".mp4", ".webm", ".mkv", ".avi")
-            )
-            media_file = next(
-                (
-                    channel_dir / f"{video_id}{ext}"
-                    for ext in expected_extensions
-                    if (channel_dir / f"{video_id}{ext}").is_file()
-                ),
-                None,
+            media_file = find_episode_media(
+                channel_dir, video_id, media_extensions_for(format_type)
             )
             if media_file is None or media_file.stat().st_size == 0:
                 raise RuntimeError("Download produced no usable media file")

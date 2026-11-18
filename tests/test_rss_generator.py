@@ -389,6 +389,50 @@ class TestRSSGenerator:
         assert 'type="audio/mp4"' in rss_content
         assert 'type="video/webm"' in rss_content
 
+    @pytest.mark.parametrize(
+        "extension, mime_type",
+        [
+            (".mp3", "audio/mpeg"),
+            (".mkv", "video/x-matroska"),
+            (".avi", "video/x-msvideo"),
+        ],
+    )
+    def test_generate_rss_feed_enclosure_type(
+        self, rss_generator, extension, mime_type
+    ):
+        """Enclosure types come from the shared media MIME map."""
+        episodes = [
+            {
+                "id": "video1",
+                "title": "Episode",
+                "upload_date": "20231201",
+                "file_size": 10,
+                "file_extension": extension,
+            }
+        ]
+
+        rss_content = rss_generator.generate_rss_feed("test-channel", episodes)
+
+        assert f'type="{mime_type}"' in rss_content
+
+    def test_scan_channel_videos_uses_first_regular_media_file(
+        self, rss_generator, temp_dir
+    ):
+        """Media lookup follows MEDIA_EXTENSIONS order and skips directories."""
+        channel_path = Path(temp_dir) / "test-channel"
+        channel_path.mkdir()
+        (channel_path / "video1.json").write_text(
+            json.dumps({"id": "video1", "title": "Test Video 1"})
+        )
+        (channel_path / "video1.mp4").mkdir()
+        (channel_path / "video1.mp3").write_bytes(b"mp3")
+        (channel_path / "video1.m4a").write_bytes(b"audio")
+
+        [episode] = rss_generator.scan_channel_videos(channel_path)
+
+        assert episode["file_extension"] == ".m4a"
+        assert episode["file_size"] == len(b"audio")
+
     def test_scan_and_generate_compose_into_feed(
         self, rss_generator, temp_dir, sample_episodes
     ):

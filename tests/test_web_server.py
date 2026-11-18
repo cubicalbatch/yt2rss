@@ -6,11 +6,14 @@ Uses dummy data based on real episode format from casually_explained.
 """
 
 import json
+from pathlib import Path
 from unittest.mock import Mock, patch
+from xml.etree import ElementTree
 
 import pytest
 import yaml
 
+from src.storage import load_tombstones, tombstoned_ids
 from src.web_server import YouTubePodcastServer
 
 
@@ -396,6 +399,58 @@ class TestEpisodeManagementAPI:
         data = json.loads(response.data)
         assert data["error"] == "Channel not found"
 
+    def test_delete_episode_response_and_tombstone(
+        self, client, test_server, setup_test_episodes
+    ):
+        """DELETE .../episodes/<id>/delete keeps its JSON shape and tombstone."""
+        response = client.delete(
+            "/api/channels/test_channel/episodes/test123abc/delete"
+        )
+        assert response.status_code == 200
+        assert response.get_json() == {
+            "success": True,
+            "message": "Episode deleted successfully",
+            "removed": ["video.m4a", "metadata", "thumbnail"],
+        }
+        assert not list(setup_test_episodes.glob("test123abc.*"))
+        assert not (setup_test_episodes / "thumbnails" / "test123abc.jpg").exists()
+        assert (setup_test_episodes / "test456def.m4a").exists()
+        record = load_tombstones(test_server.config_dir)["test_channel"]["test123abc"]
+        assert record["title"] == "Test Episode: How to Test"
+
+    def test_delete_episode_survives_undeletable_thumbnail(
+        self, client, test_server, setup_test_episodes
+    ):
+        """A stuck thumbnail no longer turns a deletion into a 500."""
+        real_unlink = Path.unlink
+
+        def flaky_unlink(path: Path, missing_ok: bool = False) -> None:
+            if path.name == "test123abc.jpg":
+                raise PermissionError("thumbnail is busy")
+            real_unlink(path, missing_ok=missing_ok)
+
+        with patch.object(Path, "unlink", flaky_unlink):
+            response = client.delete(
+                "/api/channels/test_channel/episodes/test123abc/delete"
+            )
+        assert response.status_code == 200
+        assert response.get_json()["removed"] == ["video.m4a", "metadata"]
+        assert not list(setup_test_episodes.glob("test123abc.*"))
+        assert "test123abc" in tombstoned_ids(test_server.config_dir, "test_channel")
+
+    def test_delete_episode_not_found(self, client, test_server, setup_test_episodes):
+        """Missing metadata and nothing removable both answer 404."""
+        response = client.delete("/api/channels/test_channel/episodes/ghost/delete")
+        assert response.status_code == 404
+        assert response.get_json() == {"error": "Episode not found"}
+
+        # Metadata that is a directory leaves nothing to delete.
+        (setup_test_episodes / "ghost.json").mkdir()
+        response = client.delete("/api/channels/test_channel/episodes/ghost/delete")
+        assert response.status_code == 404
+        assert response.get_json() == {"error": "No files found to delete"}
+        assert load_tombstones(test_server.config_dir) == {}
+
     def test_purge_episodes_no_episodes(self, client):
         """Test POST /api/channels/<channel_name>/purge - no episodes to purge."""
         response = client.post("/api/channels/test_channel/purge")
@@ -685,6 +740,50 @@ class TestFileSystemIntegration:
             response = client.get(f"/podcasts/test_channel/test{i}{ext}")
             assert response.status_code == 200
             assert response.data == f"media data {i}".encode()
+
+    def test_avi_media_type_is_consistent(self, client, setup_test_episodes):
+        """Feed enclosure, streaming and original download agree on .avi."""
+        (setup_test_episodes / "avi1.json").write_text(
+            json.dumps({"id": "avi1", "title": "AVI", "upload_date": "20241203"})
+        )
+        (setup_test_episodes / "avi1.avi").write_bytes(b"avi data")
+
+        feed = ElementTree.fromstring(client.get("/feeds/test_channel").data)
+        enclosures = {
+            item.findtext("guid"): item.find("enclosure")
+            for item in feed.findall("channel/item")
+        }
+        enclosure = enclosures["avi1"]
+        assert enclosure is not None
+        assert enclosure.get("type") == "video/x-msvideo"
+
+        streamed = client.get("/podcasts/test_channel/avi1.avi")
+        assert streamed.status_code == 200
+        assert streamed.mimetype == "video/x-msvideo"
+        assert streamed.data == b"avi data"
+
+        download = client.post(
+            "/api/channels/test_channel/episodes/avi1/download-original"
+        )
+        assert download.status_code == 200
+        assert download.mimetype == "video/x-msvideo"
+        assert download.data == b"avi data"
+
+    def test_audio_download_serves_audio_directly(self, client, setup_test_episodes):
+        """download-mp3 hands out stored MP3/M4A files without converting."""
+        (setup_test_episodes / "mp3ep.mp3").write_bytes(b"mp3 data")
+        with patch("src.web_server.subprocess.run") as ffmpeg:
+            for episode_id, mimetype, data in (
+                ("mp3ep", "audio/mpeg", b"mp3 data"),
+                ("test123abc", "audio/mp4", b"fake audio data"),
+            ):
+                response = client.post(
+                    f"/api/channels/test_channel/episodes/{episode_id}/download-mp3"
+                )
+                assert response.status_code == 200
+                assert response.mimetype == mimetype
+                assert response.data == data
+        ffmpeg.assert_not_called()
 
     def test_rss_generation_with_empty_channel(self, client, test_server):
         """Test RSS feed generation for channel with no episodes."""

@@ -39,10 +39,18 @@ from src.storage import (
     validate_storage_settings,
 )
 from src.utils import (
+    AUDIO_EXTENSIONS,
+    MEDIA_EXTENSIONS,
+    MEDIA_MIME_TYPES,
+    VIDEO_EXTENSIONS,
     CorruptStateFileError,
     StateFileError,
     atomic_write_text,
     cleanup_episodes,
+    collect_episodes,
+    delete_episode_files,
+    find_episode_media,
+    media_extensions_for,
     read_json_state,
     read_json_state_strict,
     require_json_object,
@@ -761,6 +769,154 @@ class TestCleanupPins:
         cleanup_episodes(tmp_path, "chan", 1)
         remaining = sorted(path.stem for path in channel.glob("*.json"))
         assert remaining == ["c"]
+
+
+class TestEpisodeFiles:
+    """Shared helpers that find, enumerate and delete stored episode files."""
+
+    LOGGER = logging.getLogger("episode-files")
+
+    @staticmethod
+    def seed_full_episode(channel: Path, episode_id: str) -> None:
+        """Store metadata, two media formats and two thumbnails."""
+        make_episode(channel, episode_id, "20240101")
+        (channel / f"{episode_id}.mp4").write_bytes(b"video")
+        thumbnails = channel / "thumbnails"
+        thumbnails.mkdir(exist_ok=True)
+        (thumbnails / f"{episode_id}.jpg").write_bytes(b"img")
+        (thumbnails / f"{episode_id}.webp").write_bytes(b"img")
+
+    def test_extension_constants_agree(self):
+        assert MEDIA_EXTENSIONS == tuple(MEDIA_MIME_TYPES)
+        assert set(AUDIO_EXTENSIONS) | set(VIDEO_EXTENSIONS) == set(MEDIA_EXTENSIONS)
+        assert not set(AUDIO_EXTENSIONS) & set(VIDEO_EXTENSIONS)
+        assert MEDIA_MIME_TYPES[".avi"] == "video/x-msvideo"
+        assert media_extensions_for("audio") == (".m4a", ".mp3")
+        assert media_extensions_for("video") == (".mp4", ".webm", ".mkv", ".avi")
+
+    def test_find_media_honors_extension_order(self, tmp_path):
+        for suffix in (".webm", ".mp3", ".m4a"):
+            (tmp_path / f"ep{suffix}").write_bytes(b"media")
+        assert find_episode_media(tmp_path, "ep") == (tmp_path / "ep.m4a").resolve()
+        assert (
+            find_episode_media(tmp_path, "ep", (".mp3", ".m4a"))
+            == (tmp_path / "ep.mp3").resolve()
+        )
+        assert (
+            find_episode_media(tmp_path, "ep", VIDEO_EXTENSIONS)
+            == (tmp_path / "ep.webm").resolve()
+        )
+        assert find_episode_media(tmp_path, "ep", (".mkv", ".avi")) is None
+
+    def test_find_media_skips_directories_and_escaping_symlinks(self, tmp_path):
+        channel = tmp_path / "chan"
+        channel.mkdir()
+        secret = tmp_path / "secret.m4a"
+        secret.write_bytes(b"private")
+        (channel / "ep.mp4").mkdir()
+        (channel / "ep.m4a").symlink_to(secret)
+        assert find_episode_media(channel, "ep") is None
+        (channel / "ep.webm").write_bytes(b"media")
+        assert find_episode_media(channel, "ep") == (channel / "ep.webm").resolve()
+
+    def test_find_media_missing_or_unsafe_id_is_none(self, tmp_path):
+        channel = tmp_path / "chan"
+        channel.mkdir()
+        (tmp_path / "ep.mp4").write_bytes(b"outside the channel")
+        assert find_episode_media(channel, "ep") is None
+        assert find_episode_media(tmp_path / "missing", "ep") is None
+        for unsafe in ("", "..", "../ep", "e*"):
+            assert find_episode_media(channel, unsafe) is None
+
+    def test_collect_episodes_lists_only_complete_episodes(self, tmp_path):
+        channel = tmp_path / "chan"
+        media = make_episode(channel, "good", "20240101")
+        make_episode(channel, "nomedia", "20240101").unlink()
+        (tmp_path / "secret.mp4").write_bytes(b"private")
+        (channel / "escape.json").write_text(json.dumps({"id": "escape"}))
+        (channel / "escape.mp4").symlink_to(tmp_path / "secret.mp4")
+
+        episodes = collect_episodes(channel)
+        assert [(episode.episode_id, episode.media_file) for episode in episodes] == [
+            ("good", media.resolve())
+        ]
+        assert episodes[0].metadata_file == channel / "good.json"
+        assert episodes[0].metadata["upload_date"] == "20240101"
+
+    def test_delete_removes_media_thumbnails_and_metadata(self, tmp_path):
+        channel = tmp_path / "chan"
+        self.seed_full_episode(channel, "ep")
+        self.seed_full_episode(channel, "ep2")  # shares the "ep" prefix
+
+        removed = delete_episode_files(channel, "ep", self.LOGGER)
+        assert removed.media == [channel / "ep.mp4", channel / "ep.m4a"]
+        assert sorted(path.name for path in removed.thumbnails) == [
+            "ep.jpg",
+            "ep.webp",
+        ]
+        assert removed.metadata == channel / "ep.json"
+        assert sorted(
+            path.relative_to(channel).as_posix()
+            for path in channel.rglob("*")
+            if path.is_file()
+        ) == [
+            "ep2.json",
+            "ep2.m4a",
+            "ep2.mp4",
+            "thumbnails/ep2.jpg",
+            "thumbnails/ep2.webp",
+        ]
+
+    def test_delete_continues_when_a_thumbnail_cannot_be_removed(
+        self, tmp_path, caplog
+    ):
+        channel = tmp_path / "chan"
+        self.seed_full_episode(channel, "ep")
+        stuck = channel / "thumbnails" / "ep.jpg"
+        real_unlink = Path.unlink
+
+        def flaky_unlink(path: Path, missing_ok: bool = False) -> None:
+            if path.name == stuck.name:
+                raise PermissionError("thumbnail is busy")
+            real_unlink(path, missing_ok=missing_ok)
+
+        with (
+            patch.object(Path, "unlink", flaky_unlink),
+            caplog.at_level(logging.WARNING, logger=self.LOGGER.name),
+        ):
+            removed = delete_episode_files(channel, "ep", self.LOGGER)
+
+        assert [path.name for path in removed.thumbnails] == ["ep.webp"]
+        assert len(removed.media) == 2
+        assert removed.metadata == channel / "ep.json"
+        assert stuck.exists()
+        assert not list(channel.glob("ep.*"))
+        assert "thumbnail is busy" in caplog.text
+
+    def test_delete_never_follows_symlinks(self, tmp_path):
+        channel = tmp_path / "chan"
+        make_episode(channel, "ep", "20240101")
+        secret = tmp_path / "secret.mp4"
+        secret.write_bytes(b"private")
+        (channel / "ep.mp4").symlink_to(secret)
+
+        removed = delete_episode_files(channel, "ep", self.LOGGER)
+        assert channel / "ep.mp4" in removed.media
+        assert not os.path.lexists(channel / "ep.mp4")
+        assert secret.read_bytes() == b"private"
+
+    def test_delete_rejects_unsafe_ids_and_skips_directories(self, tmp_path):
+        channel = tmp_path / "chan"
+        channel.mkdir()
+        victim = tmp_path / "victim.json"
+        victim.write_text("protected")
+        with pytest.raises(ValueError):
+            delete_episode_files(channel, "../victim", self.LOGGER)
+        assert victim.read_text() == "protected"
+
+        (channel / "ep.mp4").mkdir()
+        assert delete_episode_files(channel, "ep", self.LOGGER).paths == []
+        assert (channel / "ep.mp4").is_dir()
 
 
 class TestStorageAPI:

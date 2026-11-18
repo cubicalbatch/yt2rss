@@ -44,12 +44,12 @@ try:
         CorruptStateFileError,
         StateFileError,
         atomic_write_text,
+        collect_episodes,
         contained_path,
-        load_json_file,
+        delete_episode_files,
         read_json_state,
         read_json_state_strict,
         require_json_object,
-        safe_component,
         validate_bounded_number,
         validate_channel_settings,
     )
@@ -62,12 +62,12 @@ except ImportError:
         CorruptStateFileError,
         StateFileError,
         atomic_write_text,
+        collect_episodes,
         contained_path,
-        load_json_file,
+        delete_episode_files,
         read_json_state,
         read_json_state_strict,
         require_json_object,
-        safe_component,
         validate_bounded_number,
         validate_channel_settings,
     )
@@ -734,48 +734,6 @@ def _episode_age_reference(metadata: dict[str, Any], media_file: Path) -> float:
         return time.time()
 
 
-def _collect_episodes(
-    channel_dir: Path,
-) -> list[tuple[str, dict[str, Any], Path, Path]]:
-    """List valid episodes as ``(episode_id, metadata, metadata_file, media_file)``."""
-    episodes = []
-    for metadata_file in channel_dir.glob("*.json"):
-        if metadata_file.name.endswith(".info.json") or metadata_file.is_symlink():
-            continue
-        episode_id = metadata_file.stem
-        if not safe_component(episode_id):
-            continue
-        metadata = load_json_file(str(metadata_file))
-        if not metadata or metadata.get("id") != episode_id:
-            continue
-        media_file = next(
-            (
-                contained_path(channel_dir, f"{episode_id}{ext}")
-                for ext in MEDIA_EXTENSIONS
-                if contained_path(channel_dir, f"{episode_id}{ext}").is_file()
-            ),
-            None,
-        )
-        if media_file is None:
-            continue
-        episodes.append((episode_id, metadata, metadata_file, media_file))
-    return episodes
-
-
-def _delete_episode_files(
-    channel_dir: Path, episode_id: str, metadata_file: Path, logger: logging.Logger
-) -> None:
-    """Remove media, thumbnail and metadata for one episode."""
-    for ext in MEDIA_EXTENSIONS:
-        contained_path(channel_dir, f"{episode_id}{ext}").unlink(missing_ok=True)
-    for thumbnail in contained_path(channel_dir, "thumbnails").glob(f"{episode_id}.*"):
-        try:
-            thumbnail.unlink()
-        except OSError as error:
-            logger.warning(f"Could not remove thumbnail {thumbnail}: {error}")
-    metadata_file.unlink(missing_ok=True)
-
-
 def apply_retention(
     videos_dir: Path,
     channel_name: str,
@@ -816,20 +774,20 @@ def apply_retention(
     pinned = pinned or set()
     current = time.time() if now is None else now
     cutoff = current - retention_days * SECONDS_PER_DAY
-    eligible = sorted(
+    aged = (
         (
-            (reference, episode_id, metadata_file, media_file)
-            for episode_id, metadata, metadata_file, media_file in _collect_episodes(
-                channel_dir
-            )
-            if episode_id not in pinned
-            and (reference := _episode_age_reference(metadata, media_file)) < cutoff
-        ),
-        key=lambda entry: entry[0],
+            _episode_age_reference(episode.metadata, episode.media_file),
+            episode.episode_id,
+        )
+        for episode in collect_episodes(channel_dir)
+        if episode.episode_id not in pinned
+    )
+    eligible = sorted(
+        (entry for entry in aged if entry[0] < cutoff), key=lambda entry: entry[0]
     )
     removed = 0
-    for reference, episode_id, metadata_file, media_file in eligible:
-        _delete_episode_files(channel_dir, episode_id, metadata_file, log)
+    for reference, episode_id in eligible:
+        delete_episode_files(channel_dir, episode_id, log)
         age_days = (current - reference) / SECONDS_PER_DAY
         log.info(
             f"Retention: deleted {episode_id} from {channel_name} "

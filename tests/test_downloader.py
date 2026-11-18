@@ -288,6 +288,38 @@ class TestYouTubeDownloader:
 
         assert not downloader.video_exists("test-channel", "video123", "video")
 
+    @pytest.mark.parametrize(
+        "media, format_type, expected",
+        [
+            ("video123.mp3", "audio", True),
+            ("video123.m4a", "video", False),
+            ("video123.webm", "audio", False),
+            ("video123.mkv", "video", True),
+            ("video123.avi", "video", True),
+        ],
+    )
+    def test_video_exists_matches_format_extensions(
+        self, downloader, temp_dir, media, format_type, expected
+    ):
+        """Only media of the channel's format counts as downloaded."""
+        channel_dir = Path(temp_dir) / "appdata" / "podcasts" / "test-channel"
+        channel_dir.mkdir(parents=True)
+        (channel_dir / "video123.json").touch()
+        (channel_dir / media).touch()
+
+        assert downloader.video_exists("test-channel", "video123", format_type) is (
+            expected
+        )
+
+    def test_video_exists_ignores_directories(self, downloader, temp_dir):
+        """A directory named like the media file is not a download."""
+        channel_dir = Path(temp_dir) / "appdata" / "podcasts" / "test-channel"
+        channel_dir.mkdir(parents=True)
+        (channel_dir / "video123.json").touch()
+        (channel_dir / "video123.mp4").mkdir()
+
+        assert not downloader.video_exists("test-channel", "video123", "video")
+
     def test_is_video_too_new_true(self, downloader):
         """Test is_video_too_new returns True for recent video."""
         # Video uploaded 1 hour ago
@@ -379,6 +411,55 @@ class TestYouTubeDownloader:
 
         assert simple_metadata["id"] == "video123"
         assert simple_metadata["title"] == "Test Video"
+
+    @pytest.mark.parametrize(
+        "format_type, produced, expected_extension",
+        [
+            ("video", ["video123.webm", "video123.mp4"], ".mp4"),
+            ("video", ["video123.mkv"], ".mkv"),
+            ("audio", ["video123.mp3", "video123.m4a"], ".m4a"),
+            ("audio", ["video123.mp4"], None),
+            ("video", ["video123.m4a"], None),
+        ],
+    )
+    @patch("src.downloader.yt_dlp.YoutubeDL")
+    def test_download_video_finds_media_for_format(
+        self,
+        mock_ytdl,
+        downloader,
+        temp_dir,
+        format_type,
+        produced,
+        expected_extension,
+    ):
+        """The post-download lookup accepts only the format's media, in order."""
+        mock_ytdl.return_value.__enter__.return_value.download.return_value = 0
+        channel_dir = Path(temp_dir) / "appdata" / "podcasts" / "test-channel"
+        channel_dir.mkdir(parents=True)
+        (channel_dir / "video123.info.json").write_text(
+            json.dumps({"title": "Test Video"})
+        )
+        for name in produced:
+            (channel_dir / name).write_bytes(b"downloaded media")
+
+        result = downloader.download_video(
+            {
+                "id": "video123",
+                "title": "Test Video",
+                "url": "https://youtube.com/watch?v=video123",
+            },
+            "test-channel",
+            format_type=format_type,
+        )
+
+        metadata_file = channel_dir / "video123.json"
+        if expected_extension is None:
+            assert result is False
+            assert not metadata_file.exists()
+        else:
+            assert result is True
+            metadata = json.loads(metadata_file.read_text())
+            assert metadata["file_extension"] == expected_extension
 
     @patch("src.downloader.yt_dlp.YoutubeDL")
     def test_download_video_exception(self, mock_ytdl, downloader):

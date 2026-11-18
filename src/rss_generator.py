@@ -10,9 +10,19 @@ from urllib.parse import quote
 from feedgen.feed import FeedGenerator
 
 try:
-    from .utils import MEDIA_EXTENSIONS, contained_path, save_json_file
+    from .utils import (
+        MEDIA_MIME_TYPES,
+        contained_path,
+        find_episode_media,
+        save_json_file,
+    )
 except ImportError:
-    from utils import MEDIA_EXTENSIONS, contained_path, save_json_file
+    from utils import (
+        MEDIA_MIME_TYPES,
+        contained_path,
+        find_episode_media,
+        save_json_file,
+    )
 
 _timestamp_lock = threading.RLock()
 
@@ -128,9 +138,6 @@ class RSSGenerator:
             self.logger.warning(f"Channel path does not exist: {channel_path}")
             return episodes
 
-        # Support both video and audio file extensions
-        supported_extensions = MEDIA_EXTENSIONS
-
         # Find all JSON metadata files
         for json_file in channel_path.glob("*.json"):
             if json_file.name.endswith(".info.json") or json_file.is_symlink():
@@ -144,17 +151,8 @@ class RSSGenerator:
                 ):
                     continue
 
-                # Check for episode file with any supported extension
-                episode_file = None
-                for ext in supported_extensions:
-                    potential_file = contained_path(
-                        channel_path, f"{metadata['id']}{ext}"
-                    )
-                    if potential_file.exists():
-                        episode_file = potential_file
-                        break
-
-                if not episode_file:
+                episode_file = find_episode_media(channel_path, metadata["id"])
+                if episode_file is None:
                     self.logger.warning(f"Episode file missing for {metadata['id']}")
                     continue
 
@@ -249,16 +247,7 @@ class RSSGenerator:
             episode_url = f"{self.base_url}/podcasts/{quote(channel_name)}/{encoded_episode_filename}"
             tokenizable_urls.append(episode_url)
 
-            # Determine MIME type based on file extension
-            mime_type_map = {
-                ".mp4": "video/mp4",
-                ".m4a": "audio/mp4",
-                ".mp3": "audio/mpeg",
-                ".webm": "video/webm",
-                ".mkv": "video/x-matroska",
-                ".avi": "video/avi",
-            }
-            mime_type = mime_type_map.get(file_ext.lower(), "video/mp4")
+            mime_type = MEDIA_MIME_TYPES.get(file_ext.lower(), "video/mp4")
 
             fe.id(episode_url)
             fe.guid(video["id"], permalink=False)

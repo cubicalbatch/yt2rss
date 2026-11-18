@@ -89,14 +89,19 @@ try:
         validate_storage_settings,
     )
     from .utils import (
+        AUDIO_EXTENSIONS,
         MEDIA_EXTENSIONS,
+        MEDIA_MIME_TYPES,
         MediaLock,
+        RemovedEpisodeFiles,
         StateFileError,
         atomic_write_text,
         cleanup_episodes,
         contained_path,
+        delete_episode_files,
         ensure_directory,
         filter_skip_reason,
+        find_episode_media,
         load_episode_filters,
         safe_component,
         sanitize_channel_name,
@@ -156,14 +161,19 @@ except ImportError:
         validate_storage_settings,
     )
     from utils import (
+        AUDIO_EXTENSIONS,
         MEDIA_EXTENSIONS,
+        MEDIA_MIME_TYPES,
         MediaLock,
+        RemovedEpisodeFiles,
         StateFileError,
         atomic_write_text,
         cleanup_episodes,
         contained_path,
+        delete_episode_files,
         ensure_directory,
         filter_skip_reason,
+        find_episode_media,
         load_episode_filters,
         safe_component,
         sanitize_channel_name,
@@ -316,6 +326,23 @@ def next_refresh_run(
     if last_attempt is None:
         return live_run
     return max(refresh_due_time(last_attempt, interval_hours, now), live_run)
+
+
+def removed_file_labels(removed: RemovedEpisodeFiles) -> list[str]:
+    """Describe deleted episode files for the delete endpoint's response.
+
+    Args:
+        removed: Result of :func:`utils.delete_episode_files`.
+
+    Returns:
+        ``video<ext>`` per media file, then ``metadata``, then one
+        ``thumbnail`` per thumbnail, as the endpoint always reported them.
+    """
+    labels = [f"video{media.suffix}" for media in removed.media]
+    if removed.metadata is not None:
+        labels.append("metadata")
+    labels.extend("thumbnail" for _ in removed.thumbnails)
+    return labels
 
 
 def config_transaction(method: Callable[..., Any]) -> Callable[..., Any]:
@@ -2227,10 +2254,7 @@ class YouTubePodcastServer:
                 return jsonify({"error": "Channel not found"}), 404
 
             channel_dir = self.videos_dir / channel_name
-            has_media = any(
-                (channel_dir / f"{episode_id}{ext}").is_file()
-                for ext in MEDIA_EXTENSIONS
-            )
+            has_media = find_episode_media(channel_dir, episode_id) is not None
             if not (channel_dir / f"{episode_id}.json").is_file() or not has_media:
                 return jsonify({"error": "Episode not found"}), 404
 
@@ -2974,37 +2998,20 @@ class YouTubePodcastServer:
             if not channel_dir.exists():
                 return jsonify({"error": "No episodes found for this channel"}), 404
 
-            # Look for episode file with various extensions
-            episode_file = None
-            supported_extensions = [".mp4", ".m4a", ".mp3", ".webm", ".mkv", ".avi"]
-
-            for ext in supported_extensions:
-                candidate_file = channel_dir / f"{episode_id}{ext}"
-                if candidate_file.exists():
-                    episode_file = candidate_file
-                    break
-
-            if not episode_file:
+            episode_file = find_episode_media(channel_dir, episode_id)
+            if episode_file is None:
                 return jsonify({"error": "Episode file not found"}), 404
 
-            # If already MP3 or M4A, serve directly
-            if episode_file.suffix.lower() in [".mp3", ".m4a"]:
-                file_ext = episode_file.suffix.lower()
-                if file_ext == ".mp3":
-                    mimetype = "audio/mpeg"
-                    download_name = self._generate_download_filename(
-                        channel_name, episode_id, ".mp3"
-                    )
-                else:  # .m4a
-                    mimetype = "audio/mp4"
-                    download_name = self._generate_download_filename(
-                        channel_name, episode_id, ".m4a"
-                    )
-
+            # Audio (MP3 or M4A) is served directly
+            file_ext = episode_file.suffix.lower()
+            if file_ext in AUDIO_EXTENSIONS:
+                download_name = self._generate_download_filename(
+                    channel_name, episode_id, file_ext
+                )
                 try:
                     return send_file(
                         str(episode_file),
-                        mimetype=mimetype,
+                        mimetype=MEDIA_MIME_TYPES[file_ext],
                         as_attachment=True,
                         download_name=download_name,
                     )
@@ -3125,30 +3132,12 @@ class YouTubePodcastServer:
             if not channel_dir.exists():
                 return jsonify({"error": "No episodes found for this channel"}), 404
 
-            # Look for episode file with various extensions
-            episode_file = None
-            supported_extensions = [".mp4", ".m4a", ".mp3", ".webm", ".mkv", ".avi"]
-
-            for ext in supported_extensions:
-                candidate_file = channel_dir / f"{episode_id}{ext}"
-                if candidate_file.exists():
-                    episode_file = candidate_file
-                    break
-
-            if not episode_file:
+            episode_file = find_episode_media(channel_dir, episode_id)
+            if episode_file is None:
                 return jsonify({"error": "Episode file not found"}), 404
 
-            # Determine MIME type
             file_ext = episode_file.suffix.lower()
-            mimetype_map = {
-                ".mp4": "video/mp4",
-                ".m4a": "audio/mp4",
-                ".mp3": "audio/mpeg",
-                ".webm": "video/webm",
-                ".mkv": "video/x-matroska",
-                ".avi": "video/x-msvideo",
-            }
-            mimetype = mimetype_map.get(file_ext, "application/octet-stream")
+            mimetype = MEDIA_MIME_TYPES.get(file_ext, "application/octet-stream")
 
             # Generate clean download filename
             download_name = self._generate_download_filename(
@@ -3208,29 +3197,9 @@ class YouTubePodcastServer:
             except (OSError, ValueError):
                 pass
 
-            # Remove video files
-            removed_files = []
-            for ext in [".mp4", ".m4a", ".mp3", ".webm", ".mkv", ".avi"]:
-                video_file = channel_dir / f"{episode_id}{ext}"
-                if video_file.exists():
-                    video_file.unlink()
-                    removed_files.append(f"video{ext}")
-                    self.logger.info(f"Removed episode file: {video_file}")
-
-            # Remove JSON metadata
-            if json_file.exists():
-                json_file.unlink()
-                removed_files.append("metadata")
-                self.logger.info(f"Removed metadata: {json_file}")
-
-            # Remove thumbnail
-            thumbnails_dir = channel_dir / "thumbnails"
-            if thumbnails_dir.exists():
-                for thumb_file in thumbnails_dir.glob(f"{episode_id}.*"):
-                    thumb_file.unlink()
-                    removed_files.append("thumbnail")
-                    self.logger.info(f"Removed thumbnail: {thumb_file}")
-
+            removed_files = removed_file_labels(
+                delete_episode_files(channel_dir, episode_id, self.logger)
+            )
             if not removed_files:
                 return jsonify({"error": "No files found to delete"}), 404
 
@@ -3510,19 +3479,9 @@ class YouTubePodcastServer:
             self.logger.warning(f"Episode file not found: {episode_file}")
             abort(404)
 
-        # Determine MIME type based on file extension
-        file_ext = episode_file.suffix.lower()
-        mime_type_map = {
-            ".mp4": "video/mp4",
-            ".m4a": "audio/mp4",
-            ".mp3": "audio/mpeg",
-            ".webm": "video/webm",
-            ".mkv": "video/x-matroska",
-            ".avi": "video/avi",
-        }
-        mime_type = mime_type_map.get(file_ext, "video/mp4")
-
-        if file_ext not in MEDIA_EXTENSIONS:
+        # Only media is served here; metadata and other files are not.
+        mime_type = MEDIA_MIME_TYPES.get(episode_file.suffix.lower())
+        if mime_type is None:
             abort(404)
         return send_file(str(episode_file), mimetype=mime_type, conditional=True)
 

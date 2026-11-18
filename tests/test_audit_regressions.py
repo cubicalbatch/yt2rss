@@ -459,6 +459,65 @@ def test_cleanup_ignores_incomplete_metadata_and_removes_all_formats(tmp_path) -
     assert victim.read_bytes() == b"protected"
 
 
+def write_episode(channel: Path, episode_id: str, **metadata: object) -> None:
+    """Store one complete episode: metadata, media and a thumbnail."""
+    thumbnails = channel / "thumbnails"
+    thumbnails.mkdir(parents=True, exist_ok=True)
+    (channel / f"{episode_id}.json").write_text(
+        json.dumps({"id": episode_id, **metadata})
+    )
+    (channel / f"{episode_id}.m4a").write_bytes(b"episode")
+    (thumbnails / f"{episode_id}.jpg").write_bytes(b"thumbnail")
+
+
+@pytest.mark.parametrize(
+    "timestamps,kept",
+    [
+        # Ids sort opposite to upload order: an id tie-break kept "zzz".
+        ({"aaa": 1_704_100_000, "zzz": 1_704_090_000}, "aaa"),
+        ({"aaa": 1_704_090_000, "zzz": 1_704_100_000}, "zzz"),
+        # A missing timestamp counts as the oldest upload of its day.
+        ({"aaa": None, "mmm": 1_704_100_000, "zzz": 1_704_090_000}, "mmm"),
+    ],
+    ids=["newer-has-lower-id", "newer-has-higher-id", "missing-timestamp"],
+)
+def test_cleanup_breaks_same_day_ties_by_timestamp(
+    tmp_path, timestamps: dict[str, int | None], kept: str
+) -> None:
+    channel = tmp_path / "channel"
+    for episode_id, timestamp in timestamps.items():
+        metadata: dict[str, object] = {"upload_date": "20240101"}
+        if timestamp is not None:
+            metadata["timestamp"] = timestamp
+        write_episode(channel, episode_id, **metadata)
+    cleanup_episodes(tmp_path, "channel", 1)
+    assert [path.stem for path in channel.glob("*.json")] == [kept]
+    assert [path.stem for path in channel.glob("*.m4a")] == [kept]
+
+
+def test_undeletable_thumbnail_does_not_stop_cleanup(tmp_path) -> None:
+    channel = tmp_path / "channel"
+    for day in range(1, 5):
+        write_episode(channel, f"ep{day}", upload_date=f"2024010{day}")
+    stuck = channel / "thumbnails" / "ep1.jpg"
+    real_unlink = Path.unlink
+
+    def flaky_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path.name == stuck.name:
+            raise PermissionError("thumbnail is busy")
+        real_unlink(path, missing_ok=missing_ok)
+
+    with patch.object(Path, "unlink", flaky_unlink):
+        cleanup_episodes(tmp_path, "channel", 1)
+    # ep1 is deleted first; its stuck thumbnail no longer aborts the pass.
+    assert [path.name for path in channel.glob("*.json")] == ["ep4.json"]
+    assert [path.name for path in channel.glob("*.m4a")] == ["ep4.m4a"]
+    assert sorted(path.name for path in stuck.parent.iterdir()) == [
+        "ep1.jpg",
+        "ep4.jpg",
+    ]
+
+
 def test_download_failure_code_never_reports_success(tmp_path) -> None:
     downloader = YouTubeDownloader(
         str(tmp_path / "config/channels.yaml"), str(tmp_path)

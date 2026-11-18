@@ -1,20 +1,35 @@
+import dataclasses
 import json
 import logging
 import math
 import os
+import stat
 import tempfile
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, NamedTuple, TextIO
 
 try:
     import fcntl
 except ImportError:  # The web UI can still run with thread locking on Windows.
     fcntl = None
 
-MEDIA_EXTENSIONS = (".mp4", ".m4a", ".mp3", ".webm", ".mkv", ".avi")
+# Every supported episode media suffix and the MIME type it is served with
+# (feed enclosures, streaming and downloads). Order is the lookup order.
+MEDIA_MIME_TYPES: dict[str, str] = {
+    ".mp4": "video/mp4",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+}
+MEDIA_EXTENSIONS: tuple[str, ...] = tuple(MEDIA_MIME_TYPES)
+# Media a download of each channel format produces, preferred suffix first.
+AUDIO_EXTENSIONS: tuple[str, ...] = (".m4a", ".mp3")
+VIDEO_EXTENSIONS: tuple[str, ...] = (".mp4", ".webm", ".mkv", ".avi")
 # Sane upper bounds for storage controls (GB / days).
 MAX_QUOTA_GB = 16384
 MAX_MIN_FREE_GB = 1024
@@ -520,26 +535,74 @@ def filter_skip_reason(video: dict[str, Any], filters: dict[str, Any]) -> str | 
     return None
 
 
-def cleanup_episodes(
-    videos_dir: Path,
-    channel_name: str,
-    max_episodes: int,
-    pinned: set[str] | None = None,
-) -> None:
-    """Prune completed episodes using filenames as the trusted identity.
+# ---------- episode files ----------
+#
+# One episode is stored as ``<channel>/<id>.json`` (metadata),
+# ``<channel>/<id><media suffix>`` and ``<channel>/thumbnails/<id>.*``.
 
-    Pinned episodes are never removed; when pins occupy slots the channel
-    may keep more than ``max_episodes`` episodes.
+
+def media_extensions_for(format_type: str) -> tuple[str, ...]:
+    """Return the media suffixes a channel format produces, preferred first.
 
     Args:
-        videos_dir: Storage root containing the channel directory.
-        channel_name: Sanitized channel identifier.
-        max_episodes: Number of newest episodes to keep.
-        pinned: Episode ids that must never be deleted.
+        format_type: Channel format, ``audio`` or ``video``; anything else
+            is treated as ``video`` like the downloader does.
     """
-    validate_channel_settings({"max_episodes": max_episodes})
-    pinned = pinned or set()
-    channel_dir = contained_path(videos_dir, channel_name)
+    return AUDIO_EXTENSIONS if format_type == "audio" else VIDEO_EXTENSIONS
+
+
+def find_episode_media(
+    channel_dir: Path,
+    episode_id: str,
+    extensions: tuple[str, ...] = MEDIA_EXTENSIONS,
+) -> Path | None:
+    """Find an episode's media file, trying ``extensions`` in order.
+
+    Only regular files inside ``channel_dir`` count: directories, symlinks
+    resolving outside it and unsafe episode ids are skipped.
+
+    Args:
+        channel_dir: The channel's media directory.
+        episode_id: Episode (YouTube video) identifier.
+        extensions: Media suffixes in preference order.
+
+    Returns:
+        The resolved media path, or None when no candidate exists.
+    """
+    if not safe_component(episode_id):
+        return None
+    for extension in extensions:
+        try:
+            candidate = contained_path(channel_dir, f"{episode_id}{extension}")
+        except ValueError:
+            continue
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+class StoredEpisode(NamedTuple):
+    """A complete episode on disk: matching metadata plus a media file."""
+
+    episode_id: str
+    metadata: dict[str, Any]
+    metadata_file: Path
+    media_file: Path
+
+
+def collect_episodes(channel_dir: Path) -> list[StoredEpisode]:
+    """List complete episodes, using filenames as the trusted identity.
+
+    yt-dlp ``*.info.json`` leftovers, symlinked or unsafely named metadata,
+    metadata whose ``id`` differs from its filename and episodes without
+    media are skipped.
+
+    Args:
+        channel_dir: The channel's media directory; may be missing.
+
+    Returns:
+        The complete episodes in no particular order.
+    """
     episodes = []
     for metadata_file in channel_dir.glob("*.json"):
         if metadata_file.name.endswith(".info.json") or metadata_file.is_symlink():
@@ -550,23 +613,164 @@ def cleanup_episodes(
         metadata = load_json_file(str(metadata_file))
         if not metadata or metadata.get("id") != episode_id:
             continue
-        if not any(
-            contained_path(channel_dir, f"{episode_id}{ext}").is_file()
-            for ext in MEDIA_EXTENSIONS
-        ):
-            continue
-        episodes.append(
-            (str(metadata.get("upload_date") or ""), episode_id, metadata_file)
-        )
-    episodes.sort()
-    deletable = [entry for entry in episodes if entry[1] not in pinned]
-    for _, episode_id, metadata_file in deletable[:-max_episodes]:
-        for ext in MEDIA_EXTENSIONS:
-            contained_path(channel_dir, f"{episode_id}{ext}").unlink(missing_ok=True)
-        thumbnails = contained_path(channel_dir, "thumbnails")
-        for thumbnail in thumbnails.glob(f"{episode_id}.*"):
+        media_file = find_episode_media(channel_dir, episode_id)
+        if media_file is not None:
+            episodes.append(
+                StoredEpisode(episode_id, metadata, metadata_file, media_file)
+            )
+    return episodes
+
+
+@dataclasses.dataclass
+class RemovedEpisodeFiles:
+    """Files :func:`delete_episode_files` removed for one episode.
+
+    Attributes:
+        media: Removed media files in ``MEDIA_EXTENSIONS`` order.
+        thumbnails: Removed thumbnail files.
+        metadata: The removed metadata file, or None when there was none.
+    """
+
+    media: list[Path] = dataclasses.field(default_factory=list)
+    thumbnails: list[Path] = dataclasses.field(default_factory=list)
+    metadata: Path | None = None
+
+    @property
+    def paths(self) -> list[Path]:
+        """All removed files: media, thumbnails, then metadata."""
+        metadata = [self.metadata] if self.metadata is not None else []
+        return [*self.media, *self.thumbnails, *metadata]
+
+
+def _remove_entry(path: Path) -> bool:
+    """Unlink one directory entry without following symlinks.
+
+    Returns:
+        True when the entry was removed; False when it does not exist or
+        is a directory.
+
+    Raises:
+        OSError: When the entry exists but cannot be removed.
+    """
+    try:
+        if stat.S_ISDIR(path.lstat().st_mode):
+            return False
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _remove_thumbnails(
+    channel_dir: Path, episode_id: str, logger: logging.Logger
+) -> list[Path]:
+    """Remove an episode's thumbnails; failures are logged, never raised."""
+    try:
+        thumbnails_dir = contained_path(channel_dir, "thumbnails")
+        thumbnails = list(thumbnails_dir.glob(f"{episode_id}.*"))
+    except (OSError, ValueError) as error:
+        logger.warning(f"Could not list thumbnails of {episode_id}: {error}")
+        return []
+    removed = []
+    for thumbnail in thumbnails:
+        try:
             thumbnail.unlink()
-        metadata_file.unlink(missing_ok=True)
+        except OSError as error:
+            logger.warning(f"Could not remove thumbnail {thumbnail}: {error}")
+            continue
+        removed.append(thumbnail)
+    return removed
+
+
+def delete_episode_files(
+    channel_dir: Path, episode_id: str, logger: logging.Logger
+) -> RemovedEpisodeFiles:
+    """Remove one episode's media, thumbnails and metadata.
+
+    Entries are unlinked without following symlinks, so nothing outside
+    ``channel_dir`` is touched. Thumbnail failures are logged and never
+    stop the deletion. Metadata goes last: when media cannot be removed
+    the episode stays listed and a later pass retries it.
+
+    Args:
+        channel_dir: The channel's (already contained) media directory.
+        episode_id: Episode identifier; must be a safe filename component.
+        logger: Receives thumbnail failures and one debug line per file.
+
+    Returns:
+        The files that were removed.
+
+    Raises:
+        ValueError: When ``episode_id`` is not a safe filename component.
+        OSError: When a media or metadata file cannot be removed.
+    """
+    if not safe_component(episode_id):
+        raise ValueError("Invalid episode id")
+    removed = RemovedEpisodeFiles()
+    for extension in MEDIA_EXTENSIONS:
+        media = channel_dir / f"{episode_id}{extension}"
+        if _remove_entry(media):
+            removed.media.append(media)
+    removed.thumbnails = _remove_thumbnails(channel_dir, episode_id, logger)
+    metadata = channel_dir / f"{episode_id}.json"
+    if _remove_entry(metadata):
+        removed.metadata = metadata
+    for path in removed.paths:
+        logger.debug(f"Removed {path}")
+    return removed
+
+
+def _episode_timestamp(metadata: dict[str, Any]) -> float:
+    """Return the metadata's epoch ``timestamp``; missing or invalid is -inf."""
+    value = metadata.get("timestamp")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return -math.inf
+    if isinstance(value, float) and math.isnan(value):
+        return -math.inf
+    return value
+
+
+def _episode_age_key(episode: StoredEpisode) -> tuple[str, float, str]:
+    """Order episodes oldest first.
+
+    ``upload_date`` (``YYYYMMDD``) decides; same-day uploads are ordered
+    by ``timestamp`` with a missing one counting as oldest, and finally by
+    id so the order is deterministic.
+    """
+    return (
+        str(episode.metadata.get("upload_date") or ""),
+        _episode_timestamp(episode.metadata),
+        episode.episode_id,
+    )
+
+
+def cleanup_episodes(
+    videos_dir: Path,
+    channel_name: str,
+    max_episodes: int,
+    pinned: set[str] | None = None,
+) -> None:
+    """Prune completed episodes using filenames as the trusted identity.
+
+    The oldest episodes go first (see :func:`_episode_age_key`). Pinned
+    episodes are never removed; when pins occupy slots the channel may
+    keep more than ``max_episodes`` episodes. A thumbnail that cannot be
+    removed is logged and never stops the pass.
+
+    Args:
+        videos_dir: Storage root containing the channel directory.
+        channel_name: Sanitized channel identifier.
+        max_episodes: Number of newest episodes to keep.
+        pinned: Episode ids that must never be deleted.
+    """
+    validate_channel_settings({"max_episodes": max_episodes})
+    pinned = pinned or set()
+    channel_dir = contained_path(videos_dir, channel_name)
+    episodes = sorted(collect_episodes(channel_dir), key=_episode_age_key)
+    deletable = [episode for episode in episodes if episode.episode_id not in pinned]
+    logger = logging.getLogger(__name__)
+    for episode in deletable[:-max_episodes]:
+        delete_episode_files(channel_dir, episode.episode_id, logger)
 
 
 def setup_logging() -> logging.Logger:
@@ -606,76 +810,6 @@ def save_json_file(data: dict[str, Any], file_path: str) -> bool:
     except Exception as e:
         logging.error(f"Failed to save JSON file {file_path}: {e}")
         return False
-
-
-def get_episode_files(channel_dir: str) -> list[dict[str, Any]]:
-    """Get all episode files (video/audio) and metadata from channel directory."""
-    channel_path = Path(channel_dir)
-    if not channel_path.exists():
-        return []
-
-    episodes = []
-    # Support both video and audio file extensions
-    supported_extensions = [".mp4", ".m4a", ".mp3", ".webm", ".mkv", ".avi"]
-
-    for json_file in channel_path.glob("*.json"):
-        episode_id = json_file.stem
-        episode_file = None
-
-        # Check for episode file with any supported extension
-        for ext in supported_extensions:
-            potential_file = channel_path / f"{episode_id}{ext}"
-            if potential_file.exists():
-                episode_file = potential_file
-                break
-
-        if episode_file and episode_file.exists():
-            metadata = load_json_file(str(json_file))
-            if metadata:
-                metadata["file_path"] = str(episode_file)
-                metadata["id"] = episode_id
-                episodes.append(metadata)
-
-    # Sort by upload date (newest first)
-    episodes.sort(key=lambda x: str(x.get("upload_date") or ""), reverse=True)
-    return episodes
-
-
-def get_video_files(channel_dir: str) -> list[dict[str, Any]]:
-    """Legacy function name for backward compatibility."""
-    return get_episode_files(channel_dir)
-
-
-def clean_filename(filename: str) -> str:
-    """Clean filename for filesystem compatibility."""
-    invalid_chars = '<>:"/\\|?*'
-    for char in invalid_chars:
-        filename = filename.replace(char, "_")
-    return filename.strip()
-
-
-def format_duration(seconds: int) -> str:
-    """Format duration in seconds to human readable format."""
-    if not seconds:
-        return "Unknown"
-
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    seconds = seconds % 60
-
-    if hours > 0:
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-    else:
-        return f"{minutes:02d}:{seconds:02d}"
-
-
-def get_file_size_mb(file_path: str) -> float:
-    """Get file size in MB."""
-    try:
-        size_bytes = os.path.getsize(file_path)
-        return round(size_bytes / (1024 * 1024), 2)
-    except Exception:
-        return 0.0
 
 
 def sanitize_channel_name(display_name: str) -> str:
