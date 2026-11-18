@@ -102,6 +102,16 @@ class ChannelMissingError(Exception):
     """Raised when a queued job's channel is no longer configured."""
 
 
+class ConfigUnavailableError(Exception):
+    """Raised when ``channels.yaml`` cannot be read or parsed.
+
+    Unlike :class:`ChannelMissingError` this says nothing about whether the
+    job's channel still exists, so the worker defers such jobs without
+    consuming an attempt instead of cancelling them. A typo while
+    hand-editing the file therefore never wipes out the pending queue.
+    """
+
+
 class EpisodeFilteredError(Exception):
     """Raised when a queued video may no longer be downloaded.
 
@@ -395,6 +405,53 @@ class DownloadQueue:
                 progress=None,
                 cancel_requested=False,
             )
+            self._forget_memory_flag(job_id)
+            return deepcopy(job)
+
+        return self._mutate(mutate, {})
+
+    def defer(
+        self, job_id: str, error: str, delay: float = RETRY_BASE_DELAY_SECONDS
+    ) -> dict[str, Any] | None:
+        """Return a running job to ``pending`` without consuming an attempt.
+
+        Used when a job could not start for an environmental reason that
+        says nothing about the download itself, such as an unreadable
+        ``channels.yaml``. The attempt counted by :meth:`claim_next` is
+        given back, so repeated deferrals never exhaust the retry budget.
+        A cancellation requested while the job was running still wins: the
+        job is retired as ``cancelled`` instead of being deferred.
+
+        Args:
+            job_id: Identifier of the running job.
+            error: Actionable message shown while the job waits.
+            delay: Seconds until the job becomes due again.
+
+        Returns:
+            The updated job, or None when the job is unknown or not running.
+        """
+
+        def mutate(job_list: list[dict[str, Any]]) -> dict[str, Any] | None:
+            job = self._find(job_list, job_id)
+            if job is None or job.get("state") != "running":
+                return None
+            if job.get("cancel_requested") or self.memory_cancel_requested(job_id):
+                job.update(
+                    state="cancelled",
+                    finished_at=_utc_now_iso(),
+                    error="Cancelled by user",
+                    progress=None,
+                    cancel_requested=False,
+                )
+            else:
+                job.update(
+                    state="pending",
+                    attempts=max(0, int(job.get("attempts", 0)) - 1),
+                    next_attempt_at=time.time() + delay,
+                    started_at=None,
+                    progress=None,
+                    error=error,
+                )
             self._forget_memory_flag(job_id)
             return deepcopy(job)
 
@@ -743,7 +800,9 @@ def execute_queue_job(
     The channel's *current* configuration wins over the snapshot taken at
     enqueue time, so format/quality edits apply to queued work. When the
     channel was deleted the job fails with :class:`ChannelMissingError` so
-    the worker can retire it as cancelled. After a successful (or already
+    the worker can retire it as cancelled; when ``channels.yaml`` cannot be
+    read at all it fails with :class:`ConfigUnavailableError` so the worker
+    defers it instead. After a successful (or already
     present) download the per-channel refresh timestamp is updated and the
     episode cleanup that ``process_channel`` used to perform runs.
 
@@ -758,7 +817,10 @@ def execute_queue_job(
 
     Raises:
         DownloadCancelled: When ``cancel_check`` reports a cancellation.
-        ChannelMissingError: When the channel is no longer configured.
+        ConfigUnavailableError: When ``channels.yaml`` is missing,
+            unreadable, unparsable, or structurally invalid.
+        ChannelMissingError: When the channel is absent from a valid
+            configuration.
         EpisodeFilteredError: When the channel's current filters exclude
             the video or it was deleted (tombstoned) by the user; the
             worker retires such jobs as cancelled.
@@ -776,7 +838,7 @@ def execute_queue_job(
     if log_handler is not None:
         downloader.logger.addHandler(log_handler)
     try:
-        channels, global_config = downloader.load_config()
+        channels, global_config = downloader.load_config_strict()
         channel_name = job["channel"]
         channel = next(
             (entry for entry in channels if entry.get("name") == channel_name),
@@ -964,6 +1026,16 @@ def _apply_job_retention(
     return removed
 
 
+def _config_unavailable_message(error: ConfigUnavailableError) -> str:
+    """Build the actionable job error shown while channels.yaml is unusable."""
+    detail = " ".join(str(error).split())  # YAML errors span several lines.
+    return (
+        f"Waiting for a readable channels.yaml ({detail}). The job retries "
+        f"every {RETRY_BASE_DELAY_SECONDS:.0f}s without using an attempt; "
+        "fix the file to resume downloads."
+    )
+
+
 class QueueWorker:
     """Single worker thread draining a :class:`DownloadQueue`."""
 
@@ -1026,17 +1098,23 @@ class QueueWorker:
     def run_pending(self) -> int:
         """Drain due jobs synchronously; the caller holds the media lock.
 
+        Deferred and retry-scheduled jobs are not due again within the same
+        drain, so the loop always terminates. Like the background loop, the
+        politeness pause only follows successful downloads.
+
         Returns:
-            The number of jobs processed (completed, failed or cancelled).
+            The number of jobs processed (completed, failed, cancelled or
+            deferred).
         """
         processed = 0
         while not self._stop_event.is_set():
             job = self.queue.claim_next()
             if job is None:
                 break
-            self._execute(job)
+            state = self._execute(job)
             processed += 1
-            self._wait_inter_job_delay(job)
+            if state == "completed":
+                self._wait_inter_job_delay(job)
         return processed
 
     def _loop(self) -> None:
@@ -1110,6 +1188,9 @@ class QueueWorker:
             )
         except DownloadCancelled as cancellation:
             self.queue.mark_cancelled(job_id, error=str(cancellation))
+        except ConfigUnavailableError as unavailable:
+            self.logger.warning(f"Deferring job ({job_id}): {unavailable}")
+            self.queue.defer(job_id, error=_config_unavailable_message(unavailable))
         except ChannelMissingError as missing:
             self.logger.warning(f"Channel removed; cancelling job: {missing}")
             self.queue.mark_cancelled(job_id, error=str(missing))

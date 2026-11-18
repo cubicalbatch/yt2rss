@@ -181,6 +181,11 @@ single worker thread downloads them one at a time:
   actions, so downloads never race purge/delete/redownload operations.
 - The channel's *current* format/quality settings apply when a queued job
   runs; deleting a channel cancels its queued jobs.
+- If `channels.yaml` cannot be read or parsed (missing, unreadable, invalid
+  YAML, or no `channels` list), queued jobs are not cancelled: they wait and
+  retry every minute without using any of their attempts, showing the
+  reason as their error, and resume once the file is fixed. Only jobs whose
+  channel is absent from a valid configuration are cancelled.
 
 The UI shows a collapsible "Download Queue" panel with the active job's
 progress bar, pending count, and failed jobs with Retry/Dismiss actions.

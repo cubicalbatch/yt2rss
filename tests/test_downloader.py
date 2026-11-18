@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 import pytest
 import yaml
 
+from src.download_queue import ConfigUnavailableError
 from src.downloader import YouTubeDownloader
 
 
@@ -94,6 +95,71 @@ class TestYouTubeDownloader:
 
         assert channels == []
         assert global_config == {}
+
+    def test_load_config_strict_success(self, downloader, temp_dir, mock_config):
+        """The strict loader returns channels and global settings."""
+        config_path = Path(temp_dir) / "config.yaml"
+        config_path.write_text(yaml.safe_dump(mock_config))
+        downloader.config_path = str(config_path)
+
+        channels, global_config = downloader.load_config_strict()
+
+        assert [channel["name"] for channel in channels] == ["test-channel"]
+        assert global_config == {"download_delay_seconds": 30}
+
+    def test_load_config_strict_missing_file(self, downloader, temp_dir):
+        """A missing file is unavailable, not an empty configuration."""
+        downloader.config_path = str(Path(temp_dir) / "missing.yaml")
+
+        with pytest.raises(ConfigUnavailableError, match="cannot read"):
+            downloader.load_config_strict()
+        assert downloader.load_config() == ([], {})
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "invalid: yaml: content: {",
+            "",
+            "- just\n- a list\n",
+            "default_interval_hours: 24\n",
+            "channels: oops\n",
+            "channels:\n  - just-a-string\n",
+        ],
+        ids=[
+            "invalid-yaml",
+            "empty",
+            "not-a-mapping",
+            "no-channels-key",
+            "channels-not-list",
+            "channel-not-mapping",
+        ],
+    )
+    def test_load_config_strict_rejects_unusable_files(
+        self, downloader, temp_dir, content
+    ):
+        """Broken files raise strictly and stay empty for lenient callers."""
+        config_path = Path(temp_dir) / "config.yaml"
+        config_path.write_text(content)
+        downloader.config_path = str(config_path)
+
+        with pytest.raises(ConfigUnavailableError):
+            downloader.load_config_strict()
+        assert downloader.load_config() == ([], {})
+
+    def test_load_config_strict_unreadable_file(
+        self, downloader, temp_dir, mock_config
+    ):
+        """Read errors (simulated, so the test also works as root) raise."""
+        config_path = Path(temp_dir) / "config.yaml"
+        config_path.write_text(yaml.safe_dump(mock_config))
+        downloader.config_path = str(config_path)
+
+        with patch(
+            "src.downloader.open", side_effect=PermissionError("denied"), create=True
+        ):
+            with pytest.raises(ConfigUnavailableError, match="denied"):
+                downloader.load_config_strict()
+            assert downloader.load_config() == ([], {})
 
     @patch("src.downloader.yt_dlp.YoutubeDL")
     def test_get_channel_videos_success(self, mock_ytdl, downloader):

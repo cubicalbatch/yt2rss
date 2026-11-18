@@ -277,3 +277,29 @@ class TestCronHealth:
         with patch("src.cron_runner.dispatch_events") as dispatch:
             automation_runner.notify_health({})
         dispatch.assert_not_called()
+
+
+class TestCronQueueDrain:
+    """The cron drain shares the queue's unavailable-config handling."""
+
+    def test_drain_defers_jobs_while_config_is_broken(self, automation_runner):
+        automation_runner.config_path.write_text("channels: [unclosed\n")
+        jobs = [
+            automation_runner.queue.enqueue(
+                channel="test_channel_1",
+                video_id=f"v{index}",
+                title=f"Video {index}",
+                url=f"https://www.youtube.com/watch?v=v{index}",
+            )
+            for index in range(2)
+        ]
+
+        with patch("src.downloader.yt_dlp.YoutubeDL") as ytdl:
+            assert automation_runner.drain_queue() == 2
+
+        ytdl.assert_not_called()
+        for job in jobs:
+            state = automation_runner.queue.get(job["id"])
+            assert state["state"] == "pending"
+            assert state["attempts"] == 0
+            assert "channels.yaml" in state["error"]

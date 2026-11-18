@@ -13,7 +13,7 @@ from PIL import Image
 
 # Handle both relative and absolute imports
 try:
-    from .download_queue import DownloadCancelled
+    from .download_queue import ConfigUnavailableError, DownloadCancelled
     from .rss_generator import RSSGenerator
     from .storage import (
         admission_error,
@@ -31,7 +31,7 @@ try:
         validate_channel_settings,
     )
 except ImportError:
-    from download_queue import DownloadCancelled
+    from download_queue import ConfigUnavailableError, DownloadCancelled
     from rss_generator import RSSGenerator
     from storage import (
         admission_error,
@@ -106,16 +106,51 @@ class YouTubeDownloader:
         return {}
 
     def load_config(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Load channel configuration from YAML file."""
+        """Load channel configuration, treating an unusable file as empty.
+
+        Returns:
+            The configured channels and the remaining global settings, or
+            ``([], {})`` (with the error logged) when the file cannot be
+            loaded.
+        """
         try:
-            with open(self.config_path, "r") as f:
-                config = yaml.safe_load(f)
-                channels = config.get("channels", [])
-                global_config = {k: v for k, v in config.items() if k != "channels"}
-                return channels, global_config
-        except Exception as e:
+            return self.load_config_strict()
+        except ConfigUnavailableError as e:
             self.logger.error(f"Failed to load config: {e}")
             return [], {}
+
+    def load_config_strict(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Load channel configuration, failing loudly when it is unusable.
+
+        Callers that must not mistake a broken file for "no channels" (the
+        download queue) use this instead of :meth:`load_config`.
+
+        Returns:
+            The configured channels and the remaining global settings.
+
+        Raises:
+            ConfigUnavailableError: When the file is missing, unreadable, not
+                valid YAML, or not a mapping with a ``channels`` list of
+                channel mappings.
+        """
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+        except (OSError, UnicodeDecodeError) as e:
+            raise ConfigUnavailableError(f"cannot read {self.config_path}: {e}") from e
+        except yaml.YAMLError as e:
+            raise ConfigUnavailableError(
+                f"invalid YAML in {self.config_path}: {e}"
+            ) from e
+        channels = config.get("channels") if isinstance(config, dict) else None
+        if not isinstance(channels, list) or not all(
+            isinstance(channel, dict) for channel in channels
+        ):
+            raise ConfigUnavailableError(
+                f"{self.config_path} must be a mapping with a 'channels' list"
+            )
+        global_config = {k: v for k, v in config.items() if k != "channels"}
+        return channels, global_config
 
     def get_channel_videos(
         self, channel_url: str, max_episodes: int = 10

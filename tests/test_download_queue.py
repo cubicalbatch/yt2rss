@@ -11,7 +11,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 from unittest.mock import Mock, patch
 
 import pytest
@@ -22,11 +22,13 @@ from src.download_queue import (
     MAX_ATTEMPTS,
     RETRY_BASE_DELAY_SECONDS,
     ChannelMissingError,
+    ConfigUnavailableError,
     DownloadQueue,
     QueueWorker,
     backoff_delay_seconds,
     execute_queue_job,
 )
+from src.downloader import YouTubeDownloader as RealDownloader
 from tests.test_auth import auth_client as auth_client
 from tests.test_auth import auth_server as auth_server
 from tests.test_web_server import app_config as app_config
@@ -98,13 +100,9 @@ class StubDownloader:
         self.download_calls: list[dict[str, Any]] = []
         StubDownloader.instances.append(self)
 
-    def load_config(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Read channels.yaml exactly like the real downloader."""
-        with open(self.config_path, "r") as handle:
-            config = yaml.safe_load(handle) or {}
-        channels = config.get("channels", [])
-        global_config = {k: v for k, v in config.items() if k != "channels"}
-        return channels, global_config
+    def load_config_strict(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Read channels.yaml with the real downloader's strict loader."""
+        return RealDownloader.load_config_strict(cast(Any, self))
 
     def video_exists(
         self, channel_name: str, video_id: str, format_type: str = "video"
@@ -506,6 +504,44 @@ class TestQueueStateMachine:
         assert winners[0]["id"] == job["id"]
         assert queue.get(job["id"])["attempts"] == 1
 
+    def test_defer_requeues_without_consuming_an_attempt(self, queue):
+        job = enqueue_job(queue)
+        queue.claim_next()
+        queue.update_progress(job["id"], {"percent": 10, "speed": None, "eta": 5})
+        before = time.time()
+        deferred = queue.defer(job["id"], error="config broken")
+        assert deferred is not None
+        assert deferred["state"] == "pending"
+        assert deferred["attempts"] == 0
+        assert deferred["next_attempt_at"] == pytest.approx(
+            before + RETRY_BASE_DELAY_SECONDS, abs=1.0
+        )
+        assert deferred["started_at"] is None
+        assert deferred["progress"] is None
+        assert deferred["error"] == "config broken"
+        assert queue.peek_due() is None  # Not due until the delay passes.
+
+    def test_defer_only_applies_to_running_jobs(self, queue):
+        job = enqueue_job(queue)
+        assert queue.defer(job["id"], error="x") is None  # Still pending.
+        assert queue.defer("unknown", error="x") is None
+        queue.claim_next()
+        queue.mark_completed(job["id"])
+        assert queue.defer(job["id"], error="x") is None  # Already terminal.
+        assert queue.get(job["id"])["state"] == "completed"
+
+    def test_defer_honors_cross_process_cancel_request(self, queue):
+        """A cancel flag written by another process wins over deferral."""
+        job = enqueue_job(queue)
+        queue.claim_next()
+        queue.modify(job["id"], lambda item: item.update(cancel_requested=True))
+        assert queue.memory_cancel_requested(job["id"]) is False
+        updated = queue.defer(job["id"], error="config broken")
+        assert updated is not None
+        assert updated["state"] == "cancelled"
+        assert updated["error"] == "Cancelled by user"
+        assert updated["cancel_requested"] is False
+
 
 class TestQueueWorker:
     """Worker behavior with mocked yt-dlp / stub downloaders."""
@@ -844,6 +880,134 @@ class TestQueueWorker:
         assert stub.download_calls[0]["quality"] == "best"
 
 
+BROKEN_YAML = "channels: [unclosed\n"
+
+
+class TestUnavailableConfig:
+    """An unreadable channels.yaml defers jobs instead of cancelling them."""
+
+    def test_job_is_deferred_with_its_attempts_restored(self, queue):
+        job = enqueue_job(queue)
+        queue.modify(job["id"], lambda item: item.update(attempts=2))
+        executor = Mock(
+            side_effect=ConfigUnavailableError("invalid YAML:\n  line 3, denied")
+        )
+        worker = QueueWorker(queue, executor=executor)
+        before = time.time()
+        assert worker.run_pending() == 1
+        state = job_state(queue, job["id"])
+        assert state["state"] == "pending"
+        assert state["attempts"] == 2  # The claimed attempt was given back.
+        assert state["next_attempt_at"] == pytest.approx(
+            before + RETRY_BASE_DELAY_SECONDS, abs=1.0
+        )
+        assert state["started_at"] is None
+        assert state["progress"] is None
+        assert "channels.yaml" in state["error"]
+        assert "line 3, denied" in state["error"]
+        assert "without using an attempt" in state["error"]
+        assert "\n" not in state["error"]
+        executor.assert_called_once()
+
+    def test_repeated_deferrals_never_fail_or_cancel(self, queue):
+        job = enqueue_job(queue)
+        worker = QueueWorker(
+            queue, executor=Mock(side_effect=ConfigUnavailableError("broken"))
+        )
+        later = time.time()
+        for _ in range(MAX_ATTEMPTS * 3):
+            later += RETRY_BASE_DELAY_SECONDS + 1
+            claimed = queue.claim_next(now=later)
+            assert claimed is not None
+            assert worker._execute(claimed) == "pending"
+        state = job_state(queue, job["id"])
+        assert state["state"] == "pending"
+        assert state["attempts"] == 0
+
+    def test_cancel_requested_while_running_is_honored(self, queue):
+        job = enqueue_job(queue)
+
+        def executor(job, cancel_check, progress_callback):
+            queue.request_cancel(job["id"])
+            raise ConfigUnavailableError("broken")
+
+        worker = QueueWorker(queue, executor=executor)
+        assert worker.run_pending() == 1
+        state = job_state(queue, job["id"])
+        assert state["state"] == "cancelled"
+        assert state["error"] == "Cancelled by user"
+        assert queue.memory_cancel_requested(job["id"]) is False
+
+    def test_drain_terminates_without_reclaiming_or_pausing(self, queue):
+        snapshot = {"format": "video", "download_delay_seconds": 30}
+        jobs = [
+            enqueue_job(queue, video_id=f"v{index}", snapshot=snapshot)
+            for index in range(3)
+        ]
+        executor = Mock(side_effect=ConfigUnavailableError("broken"))
+        worker = QueueWorker(queue, executor=executor)
+        with patch.object(worker, "_wait_inter_job_delay") as pause:
+            assert worker.run_pending() == 3
+        assert executor.call_count == 3  # Deferred jobs are not due again.
+        pause.assert_not_called()
+        assert {job_state(queue, job["id"])["state"] for job in jobs} == {"pending"}
+
+    def test_broken_yaml_keeps_jobs_pending_until_fixed(self, test_server):
+        test_server.queue_worker.stop()
+        config_file = test_server.config_dir / "channels.yaml"
+        valid_config = config_file.read_text()
+        jobs = [enqueue_job(test_server.queue, video_id=f"v{i}") for i in range(3)]
+        drainer = QueueWorker(
+            test_server.queue,
+            executor=test_server._execute_queue_job,
+            media_lock=None,
+            logger=test_server.logger,
+        )
+        config_file.write_text(BROKEN_YAML)
+        with patch("src.downloader.YouTubeDownloader", StubDownloader):
+            assert drainer.run_pending() == 3
+            for job in jobs:
+                state = job_state(test_server.queue, job["id"])
+                assert state["state"] == "pending"
+                assert state["attempts"] == 0
+                assert "channels.yaml" in state["error"]
+            assert test_server.queue.claim_next() is None  # Not due yet.
+
+            config_file.write_text(valid_config)
+            later = time.time() + RETRY_BASE_DELAY_SECONDS + 1
+            while (claimed := test_server.queue.claim_next(now=later)) is not None:
+                drainer._execute(claimed)
+        states = [job_state(test_server.queue, job["id"]) for job in jobs]
+        assert [state["state"] for state in states] == ["completed"] * 3
+        assert [state["attempts"] for state in states] == [1, 1, 1]
+        downloaded = sorted(
+            call["video_id"]
+            for instance in StubDownloader.instances
+            for call in instance.download_calls
+        )
+        assert downloaded == ["v0", "v1", "v2"]
+
+    def test_background_worker_defers_instead_of_cancelling(
+        self, test_server, fast_worker
+    ):
+        """The reported bug: a polling worker cancelled every pending job."""
+        (test_server.config_dir / "channels.yaml").write_text(BROKEN_YAML)
+        with patch("src.downloader.YouTubeDownloader", StubDownloader):
+            jobs = [enqueue_job(test_server.queue, video_id=f"v{i}") for i in range(3)]
+            assert wait_until(
+                lambda: all(
+                    job_state(test_server.queue, job["id"])["error"] for job in jobs
+                )
+            )
+            time.sleep(0.3)  # Several poll intervals: nothing is re-claimed.
+        for job in jobs:
+            state = job_state(test_server.queue, job["id"])
+            assert state["state"] == "pending"
+            assert state["attempts"] == 0
+        assert len(StubDownloader.instances) == 3
+        assert all(not stub.download_calls for stub in StubDownloader.instances)
+
+
 class TestQueueExecutor:
     """Direct checks for the shared executor helper."""
 
@@ -860,6 +1024,39 @@ class TestQueueExecutor:
                 config_path=config_path,
                 cancel_check=lambda: False,
             )
+
+    def test_valid_empty_channel_list_raises_channel_missing(self, tmp_path, queue):
+        config_path = tmp_path / "channels.yaml"
+        config_path.write_text("channels: []\n")
+        job = enqueue_job(queue)
+        with patch("src.downloader.YouTubeDownloader", StubDownloader):
+            with pytest.raises(ChannelMissingError):
+                execute_queue_job(
+                    job,
+                    videos_dir=tmp_path / "media",
+                    config_path=config_path,
+                    cancel_check=lambda: False,
+                )
+
+    @pytest.mark.parametrize(
+        "content",
+        [None, BROKEN_YAML, "", "- a\n- list\n", "channels: oops\n"],
+        ids=["missing", "invalid-yaml", "empty", "not-a-mapping", "channels-not-list"],
+    )
+    def test_unusable_config_raises_config_unavailable(self, tmp_path, queue, content):
+        config_path = tmp_path / "channels.yaml"
+        if content is not None:
+            config_path.write_text(content)
+        job = enqueue_job(queue)
+        with patch("src.downloader.YouTubeDownloader", StubDownloader):
+            with pytest.raises(ConfigUnavailableError):
+                execute_queue_job(
+                    job,
+                    videos_dir=tmp_path / "media",
+                    config_path=config_path,
+                    cancel_check=lambda: False,
+                )
+        assert StubDownloader.instances[-1].download_calls == []
 
     def test_snapshot_used_when_channel_has_no_settings(self, tmp_path, queue):
         config_path = tmp_path / "channels.yaml"
