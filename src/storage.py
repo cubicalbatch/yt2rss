@@ -837,3 +837,60 @@ def apply_retention(
         )
         removed += 1
     return removed
+
+
+def channel_retention_days(
+    global_config: dict[str, Any], channel: dict[str, Any]
+) -> Number:
+    """Return a channel's effective retention window in days.
+
+    A per-channel ``retention_days`` of 0 (or absent) inherits the global
+    ``storage.retention_days``. Callers check this before reading pins so a
+    broken ``pins.json`` never reports a skipped pass that is disabled.
+
+    Args:
+        global_config: Configuration holding the ``storage`` key.
+        channel: Channel configuration entry.
+
+    Returns:
+        The effective window; ``0`` means retention is disabled.
+    """
+    settings = load_storage_settings(global_config)
+    return effective_channel_storage(settings, channel)["retention_days"]
+
+
+def apply_channel_retention(
+    videos_dir: Path,
+    channel: dict[str, Any],
+    global_config: dict[str, Any],
+    *,
+    pinned: set[str],
+    logger: logging.Logger,
+) -> int:
+    """Apply a channel's effective retention window; return the count deleted.
+
+    Shared by refreshes, queued downloads, daily maintenance and the cron
+    runner. Pins must come from :func:`pins_for_deletion` so an unusable
+    ``pins.json`` skips the pass before this is called.
+
+    Args:
+        videos_dir: Storage root.
+        channel: Channel configuration entry (may carry an override).
+        global_config: Configuration holding the ``storage`` key.
+        pinned: Episode ids that must never be deleted.
+        logger: Logger receiving one line per deleted episode.
+
+    Returns:
+        The number of episodes deleted; ``0`` when retention is disabled.
+
+    Raises:
+        ValueError: When the channel name escapes the storage root or the
+            effective window is out of bounds.
+    """
+    return apply_retention(
+        videos_dir,
+        channel["name"],
+        channel_retention_days(global_config, channel),
+        pinned=pinned,
+        logger=logger,
+    )

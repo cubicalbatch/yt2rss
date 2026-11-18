@@ -238,10 +238,11 @@ How enforcement works:
   largest episode already stored for the channel, and a per-format default
   (2 GB video, 200 MB audio).
 - Retention runs after every channel refresh, once at startup, and daily
-  via the scheduler. Episodes are evaluated by upload date (metadata) with
-  the file mtime as fallback, deleted oldest first, and each deletion is
-  logged. **Pinned episodes are never deleted**, by retention or by
-  `max_episodes` cleanup.
+  via the scheduler. The cron runner applies it to every channel on each
+  pass, even when that channel's discovery failed. Episodes are evaluated
+  by upload date (metadata) with the file mtime as fallback, deleted
+  oldest first, and each deletion is logged. **Pinned episodes are never
+  deleted**, by retention or by `max_episodes` cleanup.
 - **Pins** are stored in `appdata/config/pins.json` and survive episode
   redownloads and metadata rewrites. They are removed only when the
   episode (delete) or its channel (purge/delete) is removed. A corrupt or

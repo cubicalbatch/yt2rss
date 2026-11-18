@@ -68,7 +68,8 @@ try:
         GB,
         PinsUnavailableError,
         admission_error,
-        apply_retention,
+        apply_channel_retention,
+        channel_retention_days,
         effective_channel_storage,
         estimate_download_bytes,
         free_disk_bytes,
@@ -134,7 +135,8 @@ except ImportError:
         GB,
         PinsUnavailableError,
         admission_error,
-        apply_retention,
+        apply_channel_retention,
+        channel_retention_days,
         effective_channel_storage,
         estimate_download_bytes,
         free_disk_bytes,
@@ -1662,20 +1664,17 @@ class YouTubePodcastServer:
             The number of episodes deleted.
         """
         try:
-            effective = effective_channel_storage(
-                load_storage_settings(global_config), channel
-            )
-            if effective["retention_days"] <= 0:
+            if channel_retention_days(global_config, channel) <= 0:
                 return 0
             pinned = pins_for_deletion(
                 self.config_dir, channel["name"], self.logger, "retention"
             )
             if pinned is None:
                 return 0
-            removed = apply_retention(
+            removed = apply_channel_retention(
                 self.videos_dir,
-                channel["name"],
-                effective["retention_days"],
+                channel,
+                global_config,
                 pinned=pinned,
                 logger=self.logger,
             )

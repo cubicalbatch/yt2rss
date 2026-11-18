@@ -21,7 +21,9 @@ from src.storage import (
     GB,
     PinsUnavailableError,
     admission_error,
+    apply_channel_retention,
     apply_retention,
+    channel_retention_days,
     channel_usage,
     effective_channel_storage,
     estimate_download_bytes,
@@ -621,6 +623,100 @@ class TestRetention:
 
     def test_missing_channel_is_safe(self, tmp_path):
         assert apply_retention(tmp_path, "ghost", 30, now=NOW) == 0
+
+
+class TestChannelRetention:
+    """The shared resolver/applier used by web, queue and cron."""
+
+    LOGGER = logging.getLogger("channel-retention")
+
+    @staticmethod
+    def seed(tmp_path: Path) -> Path:
+        """Store one ancient, one fresh and one ancient-but-pinned episode."""
+        channel_dir = tmp_path / "chan"
+        make_episode(channel_dir, "ancient", "20000101")
+        make_episode(channel_dir, "fresh", "")  # mtime is now
+        make_episode(channel_dir, "keepme", "20000101")
+        return channel_dir
+
+    def run(
+        self,
+        tmp_path: Path,
+        channel: dict,
+        global_config: dict,
+        pinned: set[str] | None = None,
+    ) -> int:
+        return apply_channel_retention(
+            tmp_path,
+            channel,
+            global_config,
+            pinned=pinned or set(),
+            logger=self.LOGGER,
+        )
+
+    @staticmethod
+    def surviving(channel_dir: Path) -> list[str]:
+        return sorted(path.stem for path in channel_dir.glob("*.m4a"))
+
+    @pytest.mark.parametrize(
+        "channel, global_config, expected",
+        [
+            ({"name": "chan"}, {}, 0),
+            ({"name": "chan", "retention_days": 0}, {"storage": {}}, 0),
+            ({"name": "chan"}, {"storage": {"retention_days": 30}}, 30),
+            (
+                {"name": "chan", "retention_days": 0},
+                {"storage": {"retention_days": 30}},
+                30,
+            ),
+            (
+                {"name": "chan", "retention_days": 7},
+                {"storage": {"retention_days": 30}},
+                7,
+            ),
+            ({"name": "chan", "retention_days": 7}, {}, 7),
+        ],
+        ids=[
+            "disabled",
+            "zero-everywhere",
+            "global",
+            "zero-inherits-global",
+            "override-wins",
+            "override-without-global",
+        ],
+    )
+    def test_effective_days(self, channel, global_config, expected):
+        assert channel_retention_days(global_config, channel) == expected
+
+    def test_disabled_deletes_nothing(self, tmp_path):
+        channel_dir = self.seed(tmp_path)
+        config = {"storage": {"retention_days": 0}}
+        assert self.run(tmp_path, {"name": "chan", "retention_days": 0}, config) == 0
+        assert self.surviving(channel_dir) == ["ancient", "fresh", "keepme"]
+
+    def test_global_window_keeps_fresh_and_pinned(self, tmp_path):
+        channel_dir = self.seed(tmp_path)
+        config = {"storage": {"retention_days": 30}}
+        assert self.run(tmp_path, {"name": "chan"}, config, {"keepme"}) == 1
+        assert self.surviving(channel_dir) == ["fresh", "keepme"]
+        assert not (channel_dir / "ancient.json").exists()
+
+    def test_channel_override_wins_over_global(self, tmp_path):
+        channel_dir = self.seed(tmp_path)
+        # A longer per-channel window keeps what the global one would delete.
+        config = {"storage": {"retention_days": 30}}
+        keep_all = {"name": "chan", "retention_days": 36500}
+        assert self.run(tmp_path, keep_all, config) == 0
+        assert self.surviving(channel_dir) == ["ancient", "fresh", "keepme"]
+        # A shorter per-channel window deletes what the global one keeps.
+        config = {"storage": {"retention_days": 36500}}
+        assert self.run(tmp_path, {"name": "chan", "retention_days": 30}, config) == 2
+        assert self.surviving(channel_dir) == ["fresh"]
+
+    def test_out_of_bounds_global_window_raises(self, tmp_path):
+        self.seed(tmp_path)
+        with pytest.raises(ValueError):
+            self.run(tmp_path, {"name": "chan"}, {"storage": {"retention_days": 1e9}})
 
 
 class TestCleanupPins:

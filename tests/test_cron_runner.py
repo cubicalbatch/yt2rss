@@ -5,8 +5,12 @@ Tests the AutomationRunner class without calling yt-dlp.
 Only includes tests that work reliably.
 """
 
+import copy
+import fcntl
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, mock_open, patch
 
 import pytest
@@ -365,3 +369,234 @@ class TestCronQueueDrain:
             assert state["state"] == "pending"
             assert state["attempts"] == 0
             assert "channels.yaml" in state["error"]
+
+
+def days_ago(days: int) -> str:
+    """Return the ``YYYYMMDD`` upload date ``days`` days before today."""
+    return (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+
+
+def logged(method: Mock) -> str:
+    """Join every message passed to a mocked logger method."""
+    return " ".join(str(call.args[0]) for call in method.call_args_list)
+
+
+class TestCronRetention:
+    """Every cron pass applies storage retention while holding media.lock."""
+
+    @staticmethod
+    def configure(
+        runner: AutomationRunner,
+        test_config: dict[str, Any],
+        storage: dict[str, Any] | None = None,
+        overrides: dict[str, int] | None = None,
+    ) -> None:
+        """Rewrite channels.yaml with storage settings and channel overrides."""
+        config = copy.deepcopy(test_config)
+        if storage is not None:
+            config["storage"] = storage
+        for channel in config["channels"]:
+            if overrides and channel["name"] in overrides:
+                channel["retention_days"] = overrides[channel["name"]]
+        runner.config_path.write_text(yaml.safe_dump(config))
+
+    @staticmethod
+    def seed(runner: AutomationRunner, channel_name: str, **ages: int) -> Path:
+        """Store episodes (metadata + media) uploaded ``age`` days ago."""
+        channel_dir = runner.videos_dir / channel_name
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        for episode_id, age in ages.items():
+            metadata = {"id": episode_id, "title": episode_id}
+            metadata["upload_date"] = days_ago(age)
+            (channel_dir / f"{episode_id}.json").write_text(json.dumps(metadata))
+            (channel_dir / f"{episode_id}.m4a").write_bytes(b"audio")
+        return channel_dir
+
+    @staticmethod
+    def surviving(channel_dir: Path) -> list[str]:
+        return sorted(path.stem for path in channel_dir.glob("*.m4a"))
+
+    @staticmethod
+    def stub_discovery(runner: AutomationRunner) -> None:
+        """Make inline discovery succeed with nothing new, without YouTube."""
+        runner.downloader.process_channel = Mock(return_value=0)
+        runner.downloader.last_channel_error = None
+
+    def test_global_retention_keeps_recent_and_pinned(
+        self, automation_runner, test_config
+    ):
+        self.configure(automation_runner, test_config, storage={"retention_days": 30})
+        first = self.seed(
+            automation_runner, "test_channel_1", ancient=400, keepme=400, fresh=2
+        )
+        second = self.seed(automation_runner, "test_channel_2", old=40, recent=10)
+        pins_path(automation_runner.config_path.parent).write_text(
+            json.dumps({"test_channel_1": ["keepme"]})
+        )
+        self.stub_discovery(automation_runner)
+
+        assert automation_runner.run() == 0
+
+        assert self.surviving(first) == ["fresh", "keepme"]
+        assert not (first / "ancient.json").exists()
+        assert self.surviving(second) == ["recent"]
+        messages = logged(automation_runner.logger.info)
+        assert "Retention removed 1 old episode(s) from test_channel_1" in messages
+        assert "Retention removed 1 old episode(s) from test_channel_2" in messages
+
+    def test_channel_override_wins_and_zero_inherits_global(
+        self, automation_runner, test_config
+    ):
+        self.configure(
+            automation_runner,
+            test_config,
+            storage={"retention_days": 365},
+            overrides={"test_channel_1": 30, "test_channel_2": 0},
+        )
+        first = self.seed(automation_runner, "test_channel_1", mid=100, fresh=2)
+        second = self.seed(automation_runner, "test_channel_2", mid=100, ancient=400)
+        self.stub_discovery(automation_runner)
+
+        assert automation_runner.run() == 0
+
+        # The 30-day override deletes what the 365-day global window keeps.
+        assert self.surviving(first) == ["fresh"]
+        # retention_days: 0 inherits the global 365 days.
+        assert self.surviving(second) == ["mid"]
+
+    @pytest.mark.parametrize(
+        "storage", [None, {"retention_days": 0}], ids=["absent", "zero"]
+    )
+    def test_disabled_retention_deletes_nothing(
+        self, automation_runner, test_config, storage
+    ):
+        self.configure(
+            automation_runner,
+            test_config,
+            storage=storage,
+            overrides={"test_channel_1": 0},
+        )
+        channel_dir = self.seed(automation_runner, "test_channel_1", ancient=4000)
+        self.stub_discovery(automation_runner)
+
+        assert automation_runner.run() == 0
+
+        assert self.surviving(channel_dir) == ["ancient"]
+        assert "Retention removed" not in logged(automation_runner.logger.info)
+
+    def test_disabled_retention_ignores_broken_pins(
+        self, automation_runner, test_config
+    ):
+        """No retention skip is reported for a pass that is disabled."""
+        self.configure(automation_runner, test_config)
+        pins_path(automation_runner.config_path.parent).write_text("{broken")
+        self.stub_discovery(automation_runner)
+
+        automation_runner.run()
+
+        errors = logged(automation_runner.logger.error)
+        assert "Skipping cleanup for test_channel_1" in errors
+        assert "Skipping retention" not in errors
+
+    @pytest.mark.parametrize("failure", ["unavailable", "crash"])
+    def test_retention_runs_when_discovery_fails(
+        self, automation_runner, test_config, temp_directory, failure
+    ):
+        """Age-based retention never depends on YouTube being reachable."""
+        from src.downloader import YouTubeDownloader
+
+        self.configure(automation_runner, test_config, storage={"retention_days": 30})
+        channel_dir = self.seed(
+            automation_runner, "test_channel_1", ancient=400, fresh=2
+        )
+        if failure == "unavailable":
+            # The real discovery path, with yt-dlp failing like a gone channel.
+            automation_runner.downloader = YouTubeDownloader(
+                str(automation_runner.config_path),
+                videos_dir=str(automation_runner.videos_dir),
+            )
+        else:
+            automation_runner.downloader.process_channel = Mock(
+                side_effect=RuntimeError("boom")
+            )
+        automation_runner.cleanup_old_videos = Mock()
+
+        with patch("src.downloader.yt_dlp.YoutubeDL") as ytdl:
+            extract = ytdl.return_value.__enter__.return_value.extract_info
+            extract.side_effect = Exception("This channel does not exist")
+            assert automation_runner.run() == 1
+
+        assert self.surviving(channel_dir) == ["fresh"]
+        automation_runner.cleanup_old_videos.assert_not_called()
+        state = load_health(automation_runner.config_path.parent)["channels"][
+            "test_channel_1"
+        ]
+        assert state["consecutive_failures"] == 1
+        assert state["unavailable"] is (failure == "unavailable")
+        expected = "does not exist" if failure == "unavailable" else "boom"
+        assert expected in state["last_error"]
+
+    @pytest.mark.parametrize("mode", ["corrupt", "unreadable"])
+    def test_broken_pins_skip_retention(
+        self, automation_runner, test_config, unreadable_files, mode
+    ):
+        self.configure(automation_runner, test_config, storage={"retention_days": 30})
+        channel_dir = self.seed(
+            automation_runner, "test_channel_1", ancient=400, keepme=400
+        )
+        pins = pins_path(automation_runner.config_path.parent)
+        if mode == "corrupt":
+            pins.write_text('{"test_channel_1": ["keepme"')
+        else:
+            pins.write_text(json.dumps({"test_channel_1": ["keepme"]}))
+            unreadable_files(pins)
+        original = pins.read_bytes()
+        self.stub_discovery(automation_runner)
+
+        automation_runner.run()
+
+        assert self.surviving(channel_dir) == ["ancient", "keepme"]
+        assert pins.read_bytes() == original
+        errors = logged(automation_runner.logger.error)
+        assert "Skipping retention for test_channel_1" in errors
+        assert "pins.json is repaired or removed" in errors
+
+    def test_retention_error_never_fails_the_run(self, automation_runner, test_config):
+        self.configure(automation_runner, test_config, storage={"retention_days": 30})
+        self.stub_discovery(automation_runner)
+
+        with patch(
+            "src.cron_runner.apply_channel_retention",
+            side_effect=OSError("disk hiccup"),
+        ):
+            assert automation_runner.run() == 0
+
+        errors = logged(automation_runner.logger.error)
+        assert "Retention failed for test_channel_1: disk hiccup" in errors
+        assert "Retention failed for test_channel_2: disk hiccup" in errors
+        health = load_health(automation_runner.config_path.parent)["channels"]
+        assert health["test_channel_1"]["consecutive_failures"] == 0
+        assert health["test_channel_2"]["consecutive_failures"] == 0
+
+    def test_retention_runs_while_media_lock_is_held(
+        self, automation_runner, test_config
+    ):
+        self.configure(automation_runner, test_config, storage={"retention_days": 30})
+        self.stub_discovery(automation_runner)
+        locked: list[bool] = []
+
+        def probe_lock(*_args: Any, **_kwargs: Any) -> int:
+            with open(automation_runner.lock_file_path, "a") as probe:
+                try:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    locked.append(True)
+                else:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+                    locked.append(False)
+            return 0
+
+        with patch("src.cron_runner.apply_channel_retention", side_effect=probe_lock):
+            assert automation_runner.run() == 0
+
+        assert locked == [True, True]

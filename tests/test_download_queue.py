@@ -1131,6 +1131,42 @@ class TestQueueExecutor:
         assert stub.download_calls[0]["format_type"] == "audio"
         assert stub.download_calls[0]["sponsorblock"] == ["intro"]
 
+    def test_retention_applied_after_download(self, tmp_path, queue):
+        """The channel override wins over the global window; pins survive."""
+        config_path = tmp_path / "channels.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    # The global window alone would keep the 2020 episodes.
+                    "storage": {"retention_days": 3650},
+                    "channels": [
+                        {"name": "test_channel", "url": "u", "retention_days": 30}
+                    ],
+                }
+            )
+        )
+        channel_dir = tmp_path / "media" / "test_channel"
+        channel_dir.mkdir(parents=True)
+        for episode_id in ("ancient", "keepme"):
+            (channel_dir / f"{episode_id}.json").write_text(
+                json.dumps({"id": episode_id, "upload_date": "20200101"})
+            )
+            (channel_dir / f"{episode_id}.mp4").write_bytes(b"media")
+        (tmp_path / "pins.json").write_text(json.dumps({"test_channel": ["keepme"]}))
+        job = enqueue_job(queue)
+
+        with patch("src.downloader.YouTubeDownloader", StubDownloader):
+            execute_queue_job(
+                job,
+                videos_dir=tmp_path / "media",
+                config_path=config_path,
+                cancel_check=lambda: False,
+            )
+
+        remaining = sorted(path.stem for path in channel_dir.glob("*.mp4"))
+        assert remaining == ["keepme", "video1"]
+        assert not (channel_dir / "ancient.json").exists()
+
 
 class TestQueueAPI:
     """HTTP surface: auth, validation, transitions, 404/409."""

@@ -27,6 +27,8 @@ try:
         record_refresh,
     )
     from .storage import (
+        apply_channel_retention,
+        channel_retention_days,
         free_disk_bytes,
         load_storage_settings,
         pins_for_deletion,
@@ -42,7 +44,13 @@ except ImportError:
         load_notification_settings,
         record_refresh,
     )
-    from storage import free_disk_bytes, load_storage_settings, pins_for_deletion
+    from storage import (
+        apply_channel_retention,
+        channel_retention_days,
+        free_disk_bytes,
+        load_storage_settings,
+        pins_for_deletion,
+    )
     from utils import cleanup_episodes, safe_component, validate_channel_settings
 
 
@@ -226,6 +234,71 @@ class AutomationRunner:
         except Exception as error:
             self.logger.error(f"Error cleaning up {channel_name}: {error}")
 
+    def enforce_channel_retention(
+        self, channel: dict[str, Any], global_config: dict[str, Any]
+    ) -> int:
+        """Delete a channel's episodes past its effective retention window.
+
+        Skipped (with an actionable error) while ``pins.json`` is unusable.
+        Failures are logged and never fail the channel or the run.
+
+        Args:
+            channel: Validated channel configuration entry.
+            global_config: Configuration keys outside ``channels``.
+
+        Returns:
+            The number of episodes deleted.
+        """
+        channel_name = str(channel["name"])
+        try:
+            if channel_retention_days(global_config, channel) <= 0:
+                return 0
+            pinned = pins_for_deletion(
+                self.config_path.parent, channel_name, self.logger, "retention"
+            )
+            if pinned is None:
+                return 0
+            removed = apply_channel_retention(
+                self.videos_dir,
+                channel,
+                global_config,
+                pinned=pinned,
+                logger=self.logger,
+            )
+        except Exception as error:
+            self.logger.error(f"Retention failed for {channel_name}: {error}")
+            return 0
+        if removed:
+            self.logger.info(
+                f"🗑️  Retention removed {removed} old episode(s) from {channel_name}"
+            )
+        return removed
+
+    def enforce_retention(
+        self, channels: list[dict[str, Any]], global_config: dict[str, Any]
+    ) -> int:
+        """Apply retention to every channel, like the web server's maintenance.
+
+        Retention is age-based and needs no YouTube access, so it also runs
+        for channels whose discovery failed. The caller must hold the media
+        lock.
+
+        Args:
+            channels: Validated channel configuration entries.
+            global_config: Configuration keys outside ``channels``.
+
+        Returns:
+            The total number of episodes deleted.
+        """
+        self.logger.info("🗓️  Applying retention...")
+        total = sum(
+            self.enforce_channel_retention(channel, global_config)
+            for channel in channels
+        )
+        if total:
+            self.logger.info(f"✅ Retention removed {total} episode(s)")
+        return total
+
     def process_channel(
         self, channel: dict[str, Any], global_config: dict[str, Any]
     ) -> bool:
@@ -382,6 +455,9 @@ class AutomationRunner:
                         f"[{i}/{len(channels)}] ❌ Unexpected error processing channel {channel.get('name', 'unknown')}: {e}"
                     )
                     error_count += 1
+
+            # Still under the media lock; independent of discovery results.
+            self.enforce_retention(channels, global_config)
 
             # Summary
             elapsed_time = time.time() - start_time

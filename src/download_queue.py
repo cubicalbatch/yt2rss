@@ -33,8 +33,7 @@ from typing import Any, Iterator
 try:
     from .storage import (
         admission_error,
-        apply_retention,
-        effective_channel_storage,
+        apply_channel_retention,
         load_storage_settings,
         pins_for_deletion,
         tombstoned_ids,
@@ -52,8 +51,7 @@ try:
 except ImportError:
     from storage import (
         admission_error,
-        apply_retention,
-        effective_channel_storage,
+        apply_channel_retention,
         load_storage_settings,
         pins_for_deletion,
         tombstoned_ids,
@@ -1062,41 +1060,16 @@ def _prune_after_download(
         return
     try:
         cleanup_episodes(videos_dir, channel_name, max_episodes, pinned=pinned)
-        _apply_job_retention(
-            channel=channel,
-            videos_dir=videos_dir,
-            global_config=global_config,
-            pinned=pinned,
-            logger=logger,
+        removed = apply_channel_retention(
+            videos_dir, channel, global_config, pinned=pinned, logger=logger
         )
     except Exception as error:  # The download is complete; never fail the job.
         logger.error(f"Post-download cleanup failed for {channel_name}: {error}")
-
-
-def _apply_job_retention(
-    *,
-    channel: dict[str, Any],
-    videos_dir: Path,
-    global_config: dict[str, Any],
-    pinned: set[str],
-    logger: logging.Logger,
-) -> int:
-    """Apply the channel's effective retention after its download completed."""
-    effective = effective_channel_storage(load_storage_settings(global_config), channel)
-    if effective["retention_days"] <= 0:
-        return 0
-    removed = apply_retention(
-        videos_dir,
-        channel["name"],
-        effective["retention_days"],
-        pinned=pinned,
-        logger=logger,
-    )
+        return
     if removed:
         logger.info(
-            f"🗑️  Retention removed {removed} old episode(s) from {channel['name']}"
+            f"🗑️  Retention removed {removed} old episode(s) from {channel_name}"
         )
-    return removed
 
 
 def _config_unavailable_message(error: ConfigUnavailableError) -> str:
