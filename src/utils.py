@@ -6,7 +6,8 @@ import os
 import stat
 import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple, TextIO
@@ -61,6 +62,7 @@ class MediaLock:
         self.path = path
         self._thread_lock = threading.Lock()
         self._file: TextIO | None = None
+        self._owner: int | None = None
 
     def acquire(self, blocking: bool = True) -> bool:
         """Acquire the shared media lock, returning False when it is busy."""
@@ -72,6 +74,7 @@ class MediaLock:
                 self._file = self.path.open("a+")
                 flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
                 fcntl.flock(self._file.fileno(), flags)
+            self._owner = threading.get_ident()
             return True
         except OSError as error:
             self.release()
@@ -81,10 +84,86 @@ class MediaLock:
 
     def release(self) -> None:
         """Release the lock without unlinking its shared inode."""
+        self._owner = None
         if self._file is not None:
             self._file.close()
             self._file = None
         self._thread_lock.release()
+
+    def held_by_current_thread(self) -> bool:
+        """Report whether the calling thread acquired this lock."""
+        return self._owner == threading.get_ident()
+
+
+# One MediaLock per resolved lock file, shared by every caller in a process.
+_state_file_locks: dict[Path, MediaLock] = {}
+_state_file_locks_guard = threading.Lock()
+
+
+def state_lock_path(path: Path) -> Path:
+    """Return the sibling lock file guarding updates of state file ``path``."""
+    return path.with_name(f"{path.name}.lock")
+
+
+def _state_file_lock_for(path: Path) -> MediaLock:
+    """Return the process-wide lock for ``path``, keyed by its resolved path."""
+    lock_path = state_lock_path(Path(path).resolve())
+    with _state_file_locks_guard:
+        return _state_file_locks.setdefault(lock_path, MediaLock(lock_path))
+
+
+def _acquire_state_lock(lock: MediaLock, path: Path) -> bool:
+    """Block until ``lock`` is held; False (logged) when it cannot be taken."""
+    try:
+        return lock.acquire(blocking=True)
+    except OSError as error:
+        logging.getLogger(__name__).error(
+            f"Cannot lock {path.name} for an update: {error}"
+        )
+        return False
+
+
+@contextmanager
+def state_file_lock(path: Path) -> Iterator[bool]:
+    """Serialize read-modify-write cycles of a JSON state file.
+
+    Threads and processes (the web server and the cron runner may share one
+    config directory) are serialized with a :class:`MediaLock` on the
+    sibling ``<name>.lock`` file (see :func:`state_lock_path`). The data
+    file itself is never locked because writers replace it atomically, and
+    the lock file is never unlinked, so every process always locks the same
+    inode. Without ``fcntl`` only threads are serialized. A missing
+    directory is created like :func:`atomic_write_text` does.
+
+    The lock is not reentrant. Two flocks taken by one process on the same
+    file block each other, so every caller in a process shares one lock per
+    resolved path, and call sites must hold it only around a single
+    load-modify-save of that file: never nest it for the same path and
+    never do slow work such as network requests while holding it. Nesting
+    raises RuntimeError instead of deadlocking. Read-only paths need no
+    lock because writes are atomic renames.
+
+    Args:
+        path: The state file whose update is being guarded.
+
+    Yields:
+        True while the lock is held; False (logged) when it could not be
+        taken, e.g. on a read-only directory. The caller must then skip its
+        write.
+
+    Raises:
+        RuntimeError: When the calling thread already holds this lock.
+    """
+    lock = _state_file_lock_for(path)
+    if lock.held_by_current_thread():
+        raise RuntimeError(f"The {path.name} lock is already held by this thread")
+    if not _acquire_state_lock(lock, path):
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lock.release()
 
 
 def safe_component(value: object) -> bool:

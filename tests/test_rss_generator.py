@@ -160,8 +160,14 @@ class TestRSSGenerator:
 
     @patch.object(RSSGenerator, "load_refresh_timestamps")
     @patch.object(RSSGenerator, "save_refresh_timestamps")
-    def test_update_channel_refresh_time(self, mock_save, mock_load, rss_generator):
+    def test_update_channel_refresh_time(
+        self, mock_save, mock_load, rss_generator, temp_dir
+    ):
         """Test updating channel refresh time."""
+        # The update takes a lock file next to the timestamps file.
+        rss_generator.refresh_timestamps_file = (
+            Path(temp_dir) / "refresh_timestamps.json"
+        )
         mock_load.return_value = {"channel1": "2023-12-01T10:00:00Z"}
 
         with patch("src.rss_generator.datetime") as mock_datetime:

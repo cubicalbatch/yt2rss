@@ -32,12 +32,16 @@ Notifications are opt-in: without ``notifications.webhook_url`` in
 A corrupt ``health.json`` is quarantined and reads as empty. An unreadable
 one is never treated as empty data: readers degrade to an empty view with
 a log, and writers skip saving so the file is never overwritten.
+
+The web server and the cron runner both update the file, so every
+read-modify-write holds :func:`~utils.state_file_lock`; reads stay
+lock-free because writes are atomic.
 """
 
 import json
 import logging
-import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -50,6 +54,7 @@ try:
         atomic_write_text,
         read_json_state,
         require_json_object,
+        state_file_lock,
     )
 except ImportError:
     from utils import (
@@ -57,6 +62,7 @@ except ImportError:
         atomic_write_text,
         read_json_state,
         require_json_object,
+        state_file_lock,
     )
 
 HEALTH_FILENAME = "health.json"
@@ -68,8 +74,6 @@ MAX_COOLDOWN_MINUTES = 10080
 MAX_WEBHOOK_URL_LENGTH = 2000
 WEBHOOK_TIMEOUT_SECONDS = 10
 GB = 1024**3
-
-_health_lock = threading.Lock()
 
 
 class ChannelUnavailableError(RuntimeError):
@@ -200,6 +204,28 @@ def _load_health_for_update(
         return None
 
 
+@contextmanager
+def _locked_health(
+    config_dir: str | Path, action: str
+) -> Iterator[dict[str, Any] | None]:
+    """Hold the ``health.json`` lock and load the data for an update.
+
+    The web server and the cron runner both write health data, so every
+    read-modify-write runs under this cross-process lock. Callers save
+    before leaving the block and never nest it.
+
+    Args:
+        config_dir: Directory holding ``health.json``.
+        action: Description of the update for the log.
+
+    Yields:
+        The health data, or None (logged) when the lock could not be taken
+        or the file cannot be read; the caller must then skip saving.
+    """
+    with state_file_lock(health_path(config_dir)) as locked:
+        yield _load_health_for_update(config_dir, action) if locked else None
+
+
 def save_health(config_dir: str | Path, data: dict[str, Any]) -> bool:
     """Persist health data atomically; return False when the write failed."""
     try:
@@ -242,7 +268,8 @@ def record_refresh(
 
     Returns:
         The updated per-channel state. When ``health.json`` cannot be
-        read nothing is saved and the state reflects this refresh only.
+        read or locked nothing is saved and the state reflects this
+        refresh only.
     """
     timestamp = at or datetime.now(UTC).isoformat()
     entry: dict[str, Any] = {
@@ -256,8 +283,7 @@ def record_refresh(
     if error:
         entry["error"] = str(error)
 
-    with _health_lock:
-        data = _load_health_for_update(config_dir, f"refresh of {channel_name}")
+    with _locked_health(config_dir, f"refresh of {channel_name}") as data:
         channels = data["channels"] if data is not None else {}
         state = _apply_refresh(
             channels.get(channel_name) or _empty_state(), entry, error=error
@@ -307,10 +333,10 @@ def remove_channel_health(config_dir: str | Path, channel_name: str) -> bool:
 
     Returns:
         True when the state was removed; False when there was none or
-        ``health.json`` could not be read (it is then left untouched).
+        ``health.json`` could not be read or locked (it is then left
+        untouched).
     """
-    with _health_lock:
-        data = _load_health_for_update(config_dir, f"removal of {channel_name}")
+    with _locked_health(config_dir, f"removal of {channel_name}") as data:
         if data is None or channel_name not in data["channels"]:
             return False
         del data["channels"][channel_name]
@@ -578,8 +604,7 @@ def dispatch_events(
         attempts.append((event, result))
         results.append(result)
 
-    with _health_lock:
-        data = _load_health_for_update(config_dir, "notification bookkeeping")
+    with _locked_health(config_dir, "notification bookkeeping") as data:
         if data is None:
             return results
         notifications = data["notifications"]

@@ -2,7 +2,6 @@ import json
 import logging
 import math
 import os
-import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -15,6 +14,7 @@ try:
         contained_path,
         find_episode_media,
         save_json_file,
+        state_file_lock,
     )
 except ImportError:
     from utils import (
@@ -22,9 +22,8 @@ except ImportError:
         contained_path,
         find_episode_media,
         save_json_file,
+        state_file_lock,
     )
-
-_timestamp_lock = threading.RLock()
 
 
 class RSSGenerator:
@@ -115,20 +114,54 @@ class RSSGenerator:
             self.logger.error(f"Error loading refresh timestamps: {e}")
             return {}
 
-    def save_refresh_timestamps(self, timestamps: dict[str, str]):
-        """Save refresh timestamps to file"""
+    def save_refresh_timestamps(self, timestamps: dict[str, str]) -> bool:
+        """Save refresh timestamps to file; return False when it failed."""
         try:
-            save_json_file(timestamps, str(self.refresh_timestamps_file))
+            return save_json_file(timestamps, str(self.refresh_timestamps_file))
         except Exception as e:
             self.logger.error(f"Error saving refresh timestamps: {e}")
+            return False
 
-    def update_channel_refresh_time(self, channel_name: str):
-        """Update the last refresh time for a channel"""
-        with _timestamp_lock:
+    def update_channel_refresh_time(self, channel_name: str) -> None:
+        """Update the last refresh time for a channel.
+
+        Queue jobs and refreshes in the web server and the cron runner all
+        record refreshes, so the update holds the file's cross-process
+        :func:`~utils.state_file_lock`; nothing is written without it.
+
+        Args:
+            channel_name: Sanitized channel identifier.
+        """
+        with state_file_lock(self.refresh_timestamps_file) as locked:
+            if not locked:
+                return
             timestamps = self.load_refresh_timestamps()
             timestamps[channel_name] = datetime.now(UTC).isoformat()
             self.save_refresh_timestamps(timestamps)
         self.logger.info(f"Updated refresh timestamp for {channel_name}")
+
+    def remove_channel_refresh_time(self, channel_name: str) -> bool:
+        """Forget a channel's last refresh time, e.g. after a purge.
+
+        Runs under the same cross-process lock as
+        :meth:`update_channel_refresh_time`, so concurrent updates of other
+        channels are never lost.
+
+        Args:
+            channel_name: Sanitized channel identifier.
+
+        Returns:
+            True when a timestamp was removed and saved; False when there
+            was none, the lock could not be taken or the write failed.
+        """
+        with state_file_lock(self.refresh_timestamps_file) as locked:
+            if not locked:
+                return False
+            timestamps = self.load_refresh_timestamps()
+            if channel_name not in timestamps:
+                return False
+            del timestamps[channel_name]
+            return self.save_refresh_timestamps(timestamps)
 
     def scan_channel_videos(self, channel_path: Path) -> list[dict]:
         """Scan episode directory and extract metadata from JSON files"""

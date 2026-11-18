@@ -2714,27 +2714,7 @@ class YouTubePodcastServer:
                 )
                 return jsonify({"error": "Failed to delete episode files"}), 500
 
-            # Clear refresh timestamp for this channel
-            timestamps_file = self.config_dir / "refresh_timestamps.json"
-            if timestamps_file.exists():
-                try:
-                    with open(timestamps_file, "r", encoding="utf-8") as f:
-                        timestamps = json.load(f)
-
-                    if channel_name in timestamps:
-                        del timestamps[channel_name]
-
-                        atomic_write_text(
-                            timestamps_file, json.dumps(timestamps, indent=2)
-                        )
-
-                        self.logger.info(
-                            f"Cleared refresh timestamp for channel: {channel_name}"
-                        )
-                except Exception as e:
-                    self.logger.error(f"Error updating refresh timestamps: {e}")
-                    # Don't fail the whole operation for this
-
+            self._clear_refresh_timestamp(channel_name)
             return jsonify(
                 {
                     "message": f"Successfully purged all episodes for channel '{channel_name}'. RSS feed will reflect changes immediately."
@@ -2744,6 +2724,24 @@ class YouTubePodcastServer:
         except Exception as e:
             self.logger.error(f"Error purging episodes for channel {channel_name}: {e}")
             return jsonify({"error": "Internal server error"}), 500
+
+    def _clear_refresh_timestamp(self, channel_name: str) -> None:
+        """Forget a purged channel's refresh time under the file's lock.
+
+        Failures are logged and never fail the purge itself.
+
+        Args:
+            channel_name: Sanitized channel identifier.
+        """
+        generator = RSSGenerator()
+        generator.refresh_timestamps_file = self.config_dir / "refresh_timestamps.json"
+        try:
+            if generator.remove_channel_refresh_time(channel_name):
+                self.logger.info(
+                    f"Cleared refresh timestamp for channel: {channel_name}"
+                )
+        except Exception as e:
+            self.logger.error(f"Error updating refresh timestamps: {e}")
 
     def _handle_get_tombstones(self, channel_name: str):
         """List the episodes remembered as deleted for a channel."""

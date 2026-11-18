@@ -486,7 +486,11 @@ Requirements:
   enables the `Secure` cookie flag).
 - Run one web server process for a data directory so scheduling and configuration
   edits stay coordinated. On POSIX systems, the web server and standalone cron
-  runner also share a file lock to prevent overlapping media operations.
+  runner also share a file lock to prevent overlapping media operations, and
+  every update of the state files (`health.json`, `refresh_timestamps.json`,
+  `pins.json`, `tombstones.json`) holds a cross-process lock on a sibling
+  `<name>.lock` file so neither process overwrites the other's changes. Lock
+  files are never removed; leave them in place.
 
 ## Contributing
 

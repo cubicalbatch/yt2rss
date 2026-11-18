@@ -13,7 +13,9 @@ from xml.etree import ElementTree
 import pytest
 import yaml
 
+from src.rss_generator import RSSGenerator
 from src.storage import load_tombstones, tombstoned_ids
+from src.utils import state_lock_path
 from src.web_server import YouTubePodcastServer
 
 
@@ -391,6 +393,37 @@ class TestEpisodeManagementAPI:
 
         # Verify channel directory is removed
         assert not setup_test_episodes.exists()
+
+    def test_purge_clears_refresh_timestamp_under_lock(
+        self, client, test_server, setup_test_episodes
+    ):
+        """Purge drops only that channel's refresh time via the locked writer."""
+        timestamps_file = test_server.config_dir / "refresh_timestamps.json"
+        timestamps_file.write_text(
+            json.dumps(
+                {
+                    "test_channel": "2024-12-01T00:00:00+00:00",
+                    "another_channel": "2024-12-02T00:00:00+00:00",
+                }
+            )
+        )
+
+        with patch.object(
+            RSSGenerator,
+            "remove_channel_refresh_time",
+            autospec=True,
+            side_effect=RSSGenerator.remove_channel_refresh_time,
+        ) as remove:
+            response = client.post("/api/channels/test_channel/purge")
+
+        assert response.status_code == 200
+        remove.assert_called_once()
+        assert remove.call_args.args[1] == "test_channel"
+        assert json.loads(timestamps_file.read_text()) == {
+            "another_channel": "2024-12-02T00:00:00+00:00"
+        }
+        # The cross-process lock lives next to the config dir's file.
+        assert state_lock_path(timestamps_file).is_file()
 
     def test_purge_episodes_nonexistent_channel(self, client):
         """Test POST /api/channels/<channel_name>/purge - nonexistent channel."""

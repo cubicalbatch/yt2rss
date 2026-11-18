@@ -21,6 +21,10 @@ feed and the episodes API never bring them back. An explicit channel purge
 quarantined and reads as empty; an unreadable one raises
 :class:`~utils.StateFileError` so callers fail closed instead of
 forgetting every deletion.
+
+Every pin and tombstone update holds :func:`~utils.state_file_lock`, so
+writers in the web server and the cron runner never lose each other's
+changes; reads stay lock-free because writes are atomic.
 """
 
 import json
@@ -28,9 +32,9 @@ import logging
 import os
 import shutil
 import stat
-import threading
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -50,6 +54,7 @@ try:
         read_json_state,
         read_json_state_strict,
         require_json_object,
+        state_file_lock,
         validate_bounded_number,
         validate_channel_settings,
     )
@@ -68,6 +73,7 @@ except ImportError:
         read_json_state,
         read_json_state_strict,
         require_json_object,
+        state_file_lock,
         validate_bounded_number,
         validate_channel_settings,
     )
@@ -95,7 +101,6 @@ DEFAULT_ESTIMATE_AUDIO_BYTES = 200 * 1024 * 1024
 SECONDS_PER_DAY = 86400
 
 PINS_FILENAME = "pins.json"
-_pins_lock = threading.Lock()
 
 
 def is_positive_number(value: Any) -> bool:
@@ -460,6 +465,20 @@ def _load_pins_for_update(config_dir: str | Path) -> dict[str, list[str]] | None
         return None
 
 
+@contextmanager
+def _locked_pins(config_dir: str | Path) -> Iterator[dict[str, list[str]] | None]:
+    """Hold the ``pins.json`` lock and load the pins for an update.
+
+    Callers save before leaving the block and never nest it.
+
+    Yields:
+        The pins, or None (logged) when the lock could not be taken or the
+        file is unusable; the caller must then not write.
+    """
+    with state_file_lock(pins_path(config_dir)) as locked:
+        yield _load_pins_for_update(config_dir) if locked else None
+
+
 def save_pins(config_dir: str | Path, pins: dict[str, list[str]]) -> bool:
     """Persist pins atomically; return False when the write failed."""
     try:
@@ -518,8 +537,7 @@ def set_episode_pinned(
         False when ``pins.json`` could not be read (it is then left
         untouched) or the write failed.
     """
-    with _pins_lock:
-        pins = _load_pins_for_update(config_dir)
+    with _locked_pins(config_dir) as pins:
         if pins is None:
             return False
         ids = pins.setdefault(channel_name, [])
@@ -542,8 +560,7 @@ def remove_episode_pin(
         none, ``pins.json`` could not be read (left untouched) or the
         write failed.
     """
-    with _pins_lock:
-        pins = _load_pins_for_update(config_dir)
+    with _locked_pins(config_dir) as pins:
         if pins is None:
             return False
         ids = pins.get(channel_name)
@@ -563,8 +580,7 @@ def remove_channel_pins(config_dir: str | Path, channel_name: str) -> bool:
         none, ``pins.json`` could not be read (left untouched) or the
         write failed.
     """
-    with _pins_lock:
-        pins = _load_pins_for_update(config_dir)
+    with _locked_pins(config_dir) as pins:
         if pins is None or channel_name not in pins:
             return False
         del pins[channel_name]
@@ -575,7 +591,6 @@ def remove_channel_pins(config_dir: str | Path, channel_name: str) -> bool:
 
 
 TOMBSTONES_FILENAME = "tombstones.json"
-_tombstones_lock = threading.Lock()
 
 
 def tombstones_path(config_dir: str | Path) -> Path:
@@ -653,6 +668,22 @@ def _load_tombstones_for_update(
         return None
 
 
+@contextmanager
+def _locked_tombstones(
+    config_dir: str | Path,
+) -> Iterator[dict[str, dict[str, dict[str, str]]] | None]:
+    """Hold the ``tombstones.json`` lock and load the records for an update.
+
+    Callers save before leaving the block and never nest it.
+
+    Yields:
+        The tombstones, or None (logged) when the lock could not be taken
+        or the file cannot be read; the caller must then not write.
+    """
+    with state_file_lock(tombstones_path(config_dir)) as locked:
+        yield _load_tombstones_for_update(config_dir) if locked else None
+
+
 def tombstoned_ids(config_dir: str | Path, channel_name: str) -> set[str]:
     """Return the set of remembered-deleted video ids for one channel.
 
@@ -685,8 +716,7 @@ def record_tombstone(
         False when ``tombstones.json`` could not be read (it is then left
         untouched) or the write failed.
     """
-    with _tombstones_lock:
-        tombstones = _load_tombstones_for_update(config_dir)
+    with _locked_tombstones(config_dir) as tombstones:
         if tombstones is None:
             return False
         tombstones.setdefault(channel_name, {})[video_id] = {
@@ -706,8 +736,7 @@ def remove_episode_tombstone(
         there was none, the file could not be read (left untouched) or the
         write failed.
     """
-    with _tombstones_lock:
-        tombstones = _load_tombstones_for_update(config_dir)
+    with _locked_tombstones(config_dir) as tombstones:
         if tombstones is None:
             return False
         channel = tombstones.get(channel_name)
@@ -726,8 +755,7 @@ def remove_channel_tombstones(config_dir: str | Path, channel_name: str) -> int:
     again) and by channel deletion. Returns 0 without writing when the
     file could not be read, and 0 when the write failed.
     """
-    with _tombstones_lock:
-        tombstones = _load_tombstones_for_update(config_dir)
+    with _locked_tombstones(config_dir) as tombstones:
         if not tombstones or not tombstones.get(channel_name):
             return 0
         removed = len(tombstones.pop(channel_name))
