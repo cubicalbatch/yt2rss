@@ -1,9 +1,9 @@
 """Durable download queue shared by the web server and the cron runner.
 
-Every download triggered by a refresh runs as a persisted job in
-``appdata/config/download_queue.json``. Jobs survive restarts, retry with a
-deterministic exponential backoff, can be cancelled or retried manually, and
-report progress back to the UI.
+Every download triggered by a refresh, and every explicit episode
+redownload, runs as a persisted job in ``appdata/config/download_queue.json``.
+Jobs survive restarts, retry with a deterministic exponential backoff, can be
+cancelled or retried manually, and report progress back to the UI.
 
 Concurrency model:
 
@@ -20,12 +20,14 @@ Concurrency model:
 
 import json
 import logging
+import tempfile
 import threading
 import time
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
@@ -34,11 +36,14 @@ try:
     from .storage import (
         admission_error,
         apply_channel_retention,
+        free_space_error,
         load_storage_settings,
         pins_for_deletion,
+        remove_episode_tombstone,
         tombstoned_ids,
     )
     from .utils import (
+        MEDIA_EXTENSIONS,
         MediaLock,
         StateFileError,
         atomic_write_text,
@@ -52,11 +57,14 @@ except ImportError:
     from storage import (
         admission_error,
         apply_channel_retention,
+        free_space_error,
         load_storage_settings,
         pins_for_deletion,
+        remove_episode_tombstone,
         tombstoned_ids,
     )
     from utils import (
+        MEDIA_EXTENSIONS,
         MediaLock,
         StateFileError,
         atomic_write_text,
@@ -76,8 +84,12 @@ PROGRESS_MIN_INTERVAL_SECONDS = 1.0
 JOB_STATES = ("pending", "running", "completed", "failed", "cancelled")
 ACTIVE_STATES = ("pending", "running")
 TERMINAL_STATES = ("completed", "failed", "cancelled")
+# ``download`` fetches a new episode; ``redownload`` replaces a stored one.
+JOB_KINDS = ("download", "redownload")
+REDOWNLOAD_STAGING_PREFIX = ".redownload-"
 
 _JOB_DEFAULTS: dict[str, Any] = {
+    "kind": "download",
     "channel": "",
     "video_id": "",
     "title": "",
@@ -163,10 +175,12 @@ def _new_job(
     url: str,
     snapshot: dict[str, Any] | None,
     estimated_bytes: int | None = None,
+    kind: str = "download",
 ) -> dict[str, Any]:
     """Build a job record with the full persistent schema."""
     return {
         "id": uuid.uuid4().hex,
+        "kind": kind,
         "channel": channel,
         "video_id": video_id,
         "title": title,
@@ -268,8 +282,9 @@ class DownloadQueue:
         url: str,
         snapshot: dict[str, Any] | None = None,
         estimated_bytes: int | None = None,
+        kind: str = "download",
     ) -> dict[str, Any] | None:
-        """Add a download job unless an active one already covers it.
+        """Add a job unless an active one already covers the video.
 
         Args:
             channel: Sanitized channel identifier.
@@ -278,11 +293,17 @@ class DownloadQueue:
             url: Watch URL used by the downloader.
             snapshot: Channel settings captured at enqueue time.
             estimated_bytes: Worst-case size estimate used by quota checks.
+            kind: One of :data:`JOB_KINDS`.
 
         Returns:
-            The created job, or None when an active job for the same
-            (channel, video_id) pair already exists.
+            The created job, or None when an active job of any kind for the
+            same (channel, video_id) pair already exists.
+
+        Raises:
+            ValueError: When ``kind`` is not one of :data:`JOB_KINDS`.
         """
+        if kind not in JOB_KINDS:
+            raise ValueError(f"Unknown job kind: {kind}")
 
         def mutate(job_list: list[dict[str, Any]]) -> dict[str, Any] | None:
             for job in job_list:
@@ -292,7 +313,9 @@ class DownloadQueue:
                     and job.get("video_id") == video_id
                 ):
                     return None
-            job = _new_job(channel, video_id, title, url, snapshot, estimated_bytes)
+            job = _new_job(
+                channel, video_id, title, url, snapshot, estimated_bytes, kind
+            )
             job_list.append(job)
             return deepcopy(job)
 
@@ -704,6 +727,8 @@ class DownloadQueue:
         normalized.update({k: v for k, v in job.items() if v is not None})
         if normalized["state"] not in JOB_STATES:
             normalized["state"] = "pending"
+        if normalized["kind"] not in JOB_KINDS:
+            normalized["kind"] = "download"
         normalized["attempts"] = max(0, int(normalized["attempts"]))
         normalized["max_attempts"] = max(1, int(normalized["max_attempts"]))
         normalized["cancel_requested"] = bool(normalized["cancel_requested"])
@@ -811,6 +836,54 @@ def format_progress(d: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class _JobRun:
+    """Everything one execution of a queued job needs, for both job kinds.
+
+    Attributes:
+        job: Persisted job record.
+        channel: The channel's *current* configuration entry.
+        global_config: Configuration keys outside ``channels``.
+        downloader: Downloader bound to the media storage root.
+        videos_dir: Media storage root.
+        config_path: Path to ``channels.yaml``.
+        cancel_check: Returns True when a cancellation was requested.
+        progress_hook: yt-dlp progress hook reporting progress and raising
+            :class:`DownloadCancelled` on cancellation.
+        logger: Logger for queue-level messages.
+    """
+
+    job: dict[str, Any]
+    channel: dict[str, Any]
+    global_config: dict[str, Any]
+    downloader: Any
+    videos_dir: Path
+    config_path: Path
+    cancel_check: Callable[[], bool]
+    progress_hook: Callable[[dict[str, Any]], None]
+    logger: logging.Logger
+
+    @property
+    def config_dir(self) -> Path:
+        """Directory holding ``channels.yaml`` and the state files."""
+        return self.config_path.parent
+
+    @property
+    def channel_name(self) -> str:
+        """Sanitized identifier of the job's channel."""
+        return str(self.channel["name"])
+
+    @property
+    def label(self) -> str:
+        """Human-readable job name for errors and logs."""
+        return str(self.job.get("title") or self.job["video_id"])
+
+    def setting(self, key: str, default: Any) -> Any:
+        """Read a channel setting; the current config wins over the snapshot."""
+        snapshot = self.job.get("config_snapshot") or {}
+        return self.channel.get(key, snapshot.get(key, default))
+
+
 def execute_queue_job(
     job: dict[str, Any],
     *,
@@ -821,17 +894,16 @@ def execute_queue_job(
     log_handler: logging.Handler | None = None,
     logger: logging.Logger | None = None,
 ) -> None:
-    """Execute one queued download using the standard downloader pipeline.
+    """Execute one queued job using the standard downloader pipeline.
 
-    The channel's *current* configuration wins over the snapshot taken at
-    enqueue time, so format/quality edits apply to queued work. When the
-    channel was deleted the job fails with :class:`ChannelMissingError` so
-    the worker can retire it as cancelled; when ``channels.yaml`` cannot be
-    read at all it fails with :class:`ConfigUnavailableError` so the worker
-    defers it instead. After a successful (or already
-    present) download the per-channel refresh timestamp is updated and the
-    episode cleanup that ``process_channel`` used to perform runs; a
-    failure of that cleanup is logged and never fails the job.
+    Dispatches on the job ``kind``: ``download`` jobs fetch a new episode
+    (:func:`_execute_download`), ``redownload`` jobs replace a stored one
+    (:func:`_execute_redownload`). The channel's *current* configuration
+    wins over the snapshot taken at enqueue time, so format/quality edits
+    apply to queued work. When the channel was deleted the job fails with
+    :class:`ChannelMissingError` so the worker can retire it as cancelled;
+    when ``channels.yaml`` cannot be read at all it fails with
+    :class:`ConfigUnavailableError` so the worker defers it instead.
 
     Args:
         job: Persisted job record.
@@ -850,14 +922,14 @@ def execute_queue_job(
             configuration.
         EpisodeFilteredError: When the channel's current filters exclude
             the video or it was deleted (tombstoned) by the user; the
-            worker retires such jobs as cancelled.
+            worker retires such jobs as cancelled. Never raised for
+            redownloads.
         StorageLimitError: When quota or free-space protection blocks the
             download; the worker retires such jobs as terminal failures.
         StateFileError: When ``tombstones.json`` cannot be read; the job
             fails closed and is retried with the normal backoff.
         RuntimeError: When the download failed.
     """
-    queue_logger = logger if logger is not None else logging.getLogger(__name__)
     try:
         from .downloader import YouTubeDownloader
     except ImportError:
@@ -868,84 +940,217 @@ def execute_queue_job(
         downloader.logger.addHandler(log_handler)
     try:
         channels, global_config = downloader.load_config_strict()
-        channel_name = job["channel"]
-        channel = next(
-            (entry for entry in channels if entry.get("name") == channel_name),
-            None,
-        )
-        if channel is None:
-            raise ChannelMissingError(
-                f"Channel '{channel_name}' is no longer configured"
-            )
-        snapshot = job.get("config_snapshot") or {}
-        format_type = channel.get("format", snapshot.get("format", "video"))
-        quality = channel.get("quality", snapshot.get("quality", "max"))
-        sponsorblock_categories = channel.get(
-            "sponsorblock_categories",
-            snapshot.get("sponsorblock_categories", []),
-        )
-        max_episodes = channel.get("max_episodes", snapshot.get("max_episodes", 10))
-
-        # The channel's current configuration wins over the enqueue
-        # snapshot: a video that is now filtered out or was deleted by the
-        # user must never be downloaded.
-        _check_episode_filters(
-            job,
-            channel=channel,
-            config_dir=config_path.parent,
-            downloader=downloader,
-        )
-
-        if downloader.video_exists(channel_name, job["video_id"], format_type):
-            queue_logger.info(
-                f"⏭️  {job['video_id']} already downloaded; marking complete"
-            )
-        else:
-            _check_storage_admission(
-                job,
-                channel=channel,
-                videos_dir=videos_dir,
-                global_config=global_config,
-                format_type=format_type,
-            )
-
-            def progress_hook(d: dict[str, Any]) -> None:
-                """Cooperatively abort and report progress from yt-dlp."""
-                if cancel_check():
-                    raise DownloadCancelled("Cancelled by user")
-                if progress_callback is not None:
-                    progress_callback(format_progress(d))
-
-            video_info = {
-                "id": job["video_id"],
-                "title": job.get("title") or "Unknown Title",
-                "url": job["url"],
-            }
-            success = downloader.download_video(
-                video_info,
-                channel_name,
-                sponsorblock_categories=sponsorblock_categories,
-                format_type=format_type,
-                quality=quality,
-                progress_hook=progress_hook,
-            )
-            if not success:
-                raise RuntimeError(
-                    f"Download failed for '{job.get('title') or job['video_id']}'"
-                )
-
-        downloader.rss_generator.update_channel_refresh_time(channel_name)
-        _prune_after_download(
-            channel=channel,
-            max_episodes=max_episodes,
-            videos_dir=videos_dir,
-            config_dir=config_path.parent,
+        run = _JobRun(
+            job=job,
+            channel=_job_channel(job, channels),
             global_config=global_config,
-            logger=queue_logger,
+            downloader=downloader,
+            videos_dir=videos_dir,
+            config_path=config_path,
+            cancel_check=cancel_check,
+            progress_hook=_progress_hook(cancel_check, progress_callback),
+            logger=logger if logger is not None else logging.getLogger(__name__),
         )
+        if job.get("kind") == "redownload":
+            _execute_redownload(run)
+        else:
+            _execute_download(run)
     finally:
         if log_handler is not None:
             downloader.logger.removeHandler(log_handler)
+
+
+def _job_channel(job: dict[str, Any], channels: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return the job's channel entry from a valid configuration.
+
+    Raises:
+        ChannelMissingError: When the channel is no longer configured.
+    """
+    channel_name = job["channel"]
+    for channel in channels:
+        if channel.get("name") == channel_name:
+            return channel
+    raise ChannelMissingError(f"Channel '{channel_name}' is no longer configured")
+
+
+def _progress_hook(
+    cancel_check: Callable[[], bool],
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+) -> Callable[[dict[str, Any]], None]:
+    """Build the yt-dlp hook that aborts cooperatively and reports progress."""
+
+    def progress_hook(d: dict[str, Any]) -> None:
+        """Cooperatively abort and report progress from yt-dlp."""
+        if cancel_check():
+            raise DownloadCancelled("Cancelled by user")
+        if progress_callback is not None:
+            progress_callback(format_progress(d))
+
+    return progress_hook
+
+
+def _download_job_video(run: _JobRun, downloader: Any) -> bool:
+    """Download the job's video with the channel's current settings.
+
+    Args:
+        run: The job execution.
+        downloader: Downloader whose storage root receives the files.
+
+    Returns:
+        True when the downloader reported success.
+    """
+    video_info = {
+        "id": run.job["video_id"],
+        "title": run.job.get("title") or "Unknown Title",
+        "url": run.job["url"],
+    }
+    return bool(
+        downloader.download_video(
+            video_info,
+            run.channel_name,
+            sponsorblock_categories=run.setting("sponsorblock_categories", []),
+            format_type=run.setting("format", "video"),
+            quality=run.setting("quality", "max"),
+            progress_hook=run.progress_hook,
+        )
+    )
+
+
+def _execute_download(run: _JobRun) -> None:
+    """Download a new episode, then record the refresh and prune the channel.
+
+    Episode filters and tombstones are re-checked first, so a video that
+    is now filtered out or was deleted by the user is never downloaded. An
+    already present episode completes without downloading. After a
+    successful (or already present) download the per-channel refresh
+    timestamp is updated and the episode cleanup that ``process_channel``
+    used to perform runs; a failure of that cleanup is logged and never
+    fails the job.
+
+    Raises:
+        EpisodeFilteredError: When current filters or tombstones exclude it.
+        StorageLimitError: When quota or free-space protection blocks it.
+        StateFileError: When ``tombstones.json`` cannot be read.
+        RuntimeError: When the download failed.
+    """
+    job = run.job
+    format_type = run.setting("format", "video")
+    _check_episode_filters(
+        job, channel=run.channel, config_dir=run.config_dir, downloader=run.downloader
+    )
+
+    if run.downloader.video_exists(run.channel_name, job["video_id"], format_type):
+        run.logger.info(f"⏭️  {job['video_id']} already downloaded; marking complete")
+    else:
+        _check_storage_admission(
+            job,
+            channel=run.channel,
+            videos_dir=run.videos_dir,
+            global_config=run.global_config,
+            format_type=format_type,
+        )
+        if not _download_job_video(run, run.downloader):
+            raise RuntimeError(f"Download failed for '{run.label}'")
+
+    run.downloader.rss_generator.update_channel_refresh_time(run.channel_name)
+    _prune_after_download(
+        channel=run.channel,
+        max_episodes=run.setting("max_episodes", 10),
+        videos_dir=run.videos_dir,
+        config_dir=run.config_dir,
+        global_config=run.global_config,
+        logger=run.logger,
+    )
+
+
+def _execute_redownload(run: _JobRun) -> None:
+    """Replace a stored episode, keeping the original until the copy is complete.
+
+    Explicit redownloads are user actions: episode filters and tombstones
+    are not applied, and quotas are ignored because the episode replaces
+    itself, but low free-space protection still blocks them. The new copy
+    is staged in a temporary ``.redownload-*`` directory under the storage
+    root and published only when its metadata and a non-empty media file
+    exist. A failed, incomplete or cancelled download leaves the original
+    untouched, and the staging directory is always removed. Success clears
+    the episode's tombstone; ``max_episodes`` cleanup and retention do not
+    run, so a redownload never deletes other episodes.
+
+    Raises:
+        StorageLimitError: When low free-space protection blocks it.
+        DownloadCancelled: When the user cancelled the job.
+        RuntimeError: When the download failed or the copy is incomplete.
+    """
+    video_id = run.job["video_id"]
+    blocked = free_space_error(load_storage_settings(run.global_config), run.videos_dir)
+    if blocked is not None:
+        raise StorageLimitError(blocked)
+
+    with tempfile.TemporaryDirectory(
+        dir=run.videos_dir, prefix=REDOWNLOAD_STAGING_PREFIX
+    ) as staging:
+        staging_downloader = type(run.downloader)(
+            str(run.config_path), videos_dir=staging
+        )
+        downloaded = _download_job_video(run, staging_downloader)
+        # Honor a cancellation that arrived after the last progress hook.
+        if run.cancel_check():
+            raise DownloadCancelled("Cancelled by user")
+        if not downloaded or not _publish_staged_episode(
+            Path(staging) / run.channel_name,
+            contained_path(run.videos_dir, run.channel_name),
+            video_id,
+        ):
+            raise RuntimeError(
+                f"Redownload failed for '{run.label}'; original episode preserved"
+            )
+
+    # A successful explicit redownload lifts the tombstone so the episode
+    # is a normal, downloadable episode again.
+    if remove_episode_tombstone(run.config_dir, run.channel_name, video_id):
+        run.logger.info(f"Cleared tombstone for redownloaded {video_id}")
+    run.logger.info(f"✅ Redownloaded episode {video_id}")
+
+
+def _staged_media(staged_channel: Path, video_id: str) -> list[Path]:
+    """Return the non-empty media files a staged download produced."""
+    candidates = (staged_channel / f"{video_id}{ext}" for ext in MEDIA_EXTENSIONS)
+    return [path for path in candidates if path.is_file() and path.stat().st_size > 0]
+
+
+def _publish_staged_episode(
+    staged_channel: Path, channel_dir: Path, video_id: str
+) -> bool:
+    """Move a complete staged episode over the stored one.
+
+    Thumbnails and media move first and the metadata last; stored media
+    with an extension the new copy does not have is removed afterwards.
+
+    Args:
+        staged_channel: The channel directory inside the staging root.
+        channel_dir: The channel's media directory in the storage root.
+        video_id: Episode (YouTube video) identifier.
+
+    Returns:
+        True when the episode was published; False, with nothing touched,
+        when the staged metadata or a non-empty media file is missing.
+    """
+    staged_metadata = staged_channel / f"{video_id}.json"
+    staged_media = _staged_media(staged_channel, video_id)
+    if not staged_metadata.is_file() or not staged_media:
+        return False
+    thumbnails = channel_dir / "thumbnails"
+    thumbnails.mkdir(parents=True, exist_ok=True)
+    for thumbnail in (staged_channel / "thumbnails").glob(f"{video_id}.*"):
+        thumbnail.replace(thumbnails / thumbnail.name)
+    for media in staged_media:
+        media.replace(channel_dir / media.name)
+    staged_metadata.replace(channel_dir / f"{video_id}.json")
+    new_names = {media.name for media in staged_media}
+    for ext in MEDIA_EXTENSIONS:
+        if f"{video_id}{ext}" not in new_names:
+            (channel_dir / f"{video_id}{ext}").unlink(missing_ok=True)
+    return True
 
 
 def _job_estimate_bytes(job: dict[str, Any]) -> int | None:
@@ -1194,7 +1399,7 @@ class QueueWorker:
             if self.media_lock is not None:
                 self.media_lock.release()
         # Politeness pauses must not hold the media lock: otherwise a manual
-        # refresh, delete or redownload returns 409 for the whole delay.
+        # refresh, purge or delete returns 409 for the whole delay.
         if job is not None and state == "completed":
             self._wait_inter_job_delay(job)
         return True

@@ -370,6 +370,41 @@ class TestCronQueueDrain:
             assert state["attempts"] == 0
             assert "channels.yaml" in state["error"]
 
+    def test_drain_processes_redownload_job(self, automation_runner):
+        channel_dir = automation_runner.videos_dir / "test_channel_1"
+        channel_dir.mkdir(parents=True)
+        (channel_dir / "ep1.json").write_text(json.dumps({"id": "ep1", "title": "Old"}))
+        (channel_dir / "ep1.mp4").write_bytes(b"old video")
+        job = automation_runner.queue.enqueue(
+            channel="test_channel_1",
+            video_id="ep1",
+            title="Old",
+            url="https://www.youtube.com/watch?v=ep1",
+            kind="redownload",
+        )
+        assert job is not None
+
+        def staged(downloader, video, channel_name, **kwargs) -> bool:
+            staged_dir = Path(downloader.videos_dir) / channel_name
+            staged_dir.mkdir(parents=True, exist_ok=True)
+            (staged_dir / "ep1.m4a").write_bytes(b"new audio")
+            (staged_dir / "ep1.json").write_text(json.dumps({"id": "ep1"}))
+            return True
+
+        with patch(
+            "src.downloader.YouTubeDownloader.download_video",
+            autospec=True,
+            side_effect=staged,
+        ) as download:
+            assert automation_runner.drain_queue() == 1
+
+        assert automation_runner.queue.get(job["id"])["state"] == "completed"
+        # test_channel_1 is configured for audio now.
+        assert download.call_args.kwargs["format_type"] == "audio"
+        assert (channel_dir / "ep1.m4a").read_bytes() == b"new audio"
+        assert not (channel_dir / "ep1.mp4").exists()
+        assert list(automation_runner.videos_dir.glob(".redownload-*")) == []
+
 
 def days_ago(days: int) -> str:
     """Return the ``YYYYMMDD`` upload date ``days`` days before today."""

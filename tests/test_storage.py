@@ -28,6 +28,7 @@ from src.storage import (
     effective_channel_storage,
     estimate_download_bytes,
     free_disk_bytes,
+    free_space_error,
     load_pins,
     load_storage_settings,
     measure_media_usage,
@@ -61,6 +62,7 @@ from tests.test_auth import auth_server as auth_server
 from tests.test_download_queue import StubDownloader, enqueue_job
 from tests.test_download_queue import config_dir as config_dir
 from tests.test_download_queue import queue as queue
+from tests.test_redownload import redownload_and_run
 from tests.test_web_server import (
     another_episode_metadata as another_episode_metadata,
 )
@@ -485,6 +487,23 @@ class TestEstimatesAndAdmission:
             free_bytes=100 * GB,
         )
         assert blocked is None
+
+    @pytest.mark.parametrize(
+        "minimum,free,expected",
+        [(1, int(0.5 * GB), "0.5 GB free, 1 GB required"), (1, 2 * GB, None)],
+    )
+    def test_free_space_error_ignores_quotas(self, tmp_path, minimum, free, expected):
+        settings = dict(self.BASE_SETTINGS, global_quota_gb=0.000001)
+        settings["min_free_space_gb"] = minimum
+        blocked = free_space_error(settings, tmp_path, free)
+        assert blocked == (
+            None if expected is None else f"Insufficient free disk space: {expected}"
+        )
+
+    def test_free_space_error_reports_failed_query(self, tmp_path):
+        with patch("src.storage.free_disk_bytes", side_effect=OSError("gone")):
+            blocked = free_space_error(self.BASE_SETTINGS, tmp_path)
+        assert blocked == "Free disk space check failed: gone"
 
     def test_free_space_queried_when_not_supplied(self, tmp_path):
         # tmp_path exists so the real disk_usage query succeeds and, with a
@@ -1106,7 +1125,7 @@ class TestPinAPI:
             == 401
         )
 
-    def test_pin_survives_redownload(self, client, setup_test_episodes):
+    def test_pin_survives_redownload(self, client, test_server, setup_test_episodes):
         client.post("/api/channels/test_channel/episodes/test123abc/pin")
 
         def download(downloader, video, channel_name, **kwargs) -> bool:
@@ -1124,12 +1143,7 @@ class TestPinAPI:
             autospec=True,
             side_effect=download,
         ):
-            assert (
-                client.post(
-                    "/api/channels/test_channel/episodes/test123abc/redownload"
-                ).status_code
-                == 200
-            )
+            assert redownload_and_run(test_server)["state"] == "completed"
 
         episodes = client.get("/api/channels/test_channel/episodes").get_json()
         flags = {episode["id"]: episode["pinned"] for episode in episodes["episodes"]}

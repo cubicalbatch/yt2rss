@@ -103,6 +103,7 @@ try:
         filter_skip_reason,
         find_episode_media,
         load_episode_filters,
+        load_json_file,
         safe_component,
         sanitize_channel_name,
         setup_logging,
@@ -175,6 +176,7 @@ except ImportError:
         filter_skip_reason,
         find_episode_media,
         load_episode_filters,
+        load_json_file,
         safe_component,
         sanitize_channel_name,
         setup_logging,
@@ -343,6 +345,28 @@ def removed_file_labels(removed: RemovedEpisodeFiles) -> list[str]:
         labels.append("metadata")
     labels.extend("thumbnail" for _ in removed.thumbnails)
     return labels
+
+
+def queue_job_snapshot(
+    channel: dict[str, Any], global_config: dict[str, Any]
+) -> dict[str, Any]:
+    """Capture the channel settings a queued job records at enqueue time.
+
+    Args:
+        channel: Channel configuration entry.
+        global_config: Configuration keys outside ``channels``.
+
+    Returns:
+        The snapshot stored as the job's ``config_snapshot``.
+    """
+    return {
+        "format": channel.get("format", "video"),
+        "quality": channel.get("quality", "max"),
+        "sponsorblock_categories": channel.get("sponsorblock_categories", []),
+        "max_episodes": channel.get("max_episodes", 10),
+        "download_delay_hours": channel.get("download_delay_hours", 0),
+        "download_delay_seconds": global_config.get("download_delay_seconds", 60),
+    }
 
 
 def config_transaction(method: Callable[..., Any]) -> Callable[..., Any]:
@@ -1528,14 +1552,7 @@ class YouTubePodcastServer:
         check_delay_seconds = channel.get(
             "check_delay_seconds", global_config.get("check_delay_seconds", 0)
         )
-        snapshot = {
-            "format": format_type,
-            "quality": channel.get("quality", "max"),
-            "sponsorblock_categories": channel.get("sponsorblock_categories", []),
-            "max_episodes": max_episodes,
-            "download_delay_hours": download_delay_hours,
-            "download_delay_seconds": global_config.get("download_delay_seconds", 60),
-        }
+        snapshot = queue_job_snapshot(channel, global_config)
         settings = load_storage_settings(global_config)
         usage = measure_media_usage(self.videos_dir)
         try:
@@ -3237,135 +3254,103 @@ class YouTubePodcastServer:
             )
             return jsonify({"error": "Internal server error"}), 500
 
-    @exclusive_media_operation
     def _handle_redownload_episode(self, channel_name: str, episode_id: str):
-        """Handle redownloading a single episode.
+        """Queue an explicit redownload of a single episode.
 
-        Explicit redownloads are allowed even for remembered-deleted
-        (tombstoned) episodes; success clears the tombstone.
+        Validates the request and answers immediately with HTTP 202 and the
+        queued ``redownload`` job; the queue worker downloads the new copy
+        under the shared media lock and keeps the stored episode until the
+        copy is complete. Explicit redownloads are allowed even for
+        remembered-deleted (tombstoned) episodes; success clears the
+        tombstone.
         """
         try:
-            # Validate channel exists in config
             config = self._load_channel_config()
-            channels = config.get("channels", [])
-            channel_config = None
-            for ch in channels:
-                if ch["name"] == channel_name:
-                    channel_config = ch
-                    break
-
+            channel_config = next(
+                (
+                    channel
+                    for channel in config.get("channels", [])
+                    if channel["name"] == channel_name
+                ),
+                None,
+            )
             if not channel_config:
                 return jsonify({"error": "Channel not found"}), 404
 
-            # Redownload replaces the stored episode; for a remembered-
-            # deleted (tombstoned) episode there are no files left, but an
-            # explicit redownload is allowed and clears its tombstone once
-            # it succeeds.
-            channel_dir = self.videos_dir / channel_name
-            json_file = channel_dir / f"{episode_id}.json"
+            title = self._redownload_title(channel_name, episode_id)
+            if title is None:
+                return jsonify({"error": "Episode not found"}), 404
 
-            metadata: dict[str, Any]
-            if not json_file.exists():
-                tombstone = (
-                    load_tombstones(self.config_dir, quarantine=False)
-                    .get(channel_name, {})
-                    .get(episode_id)
-                )
-                if tombstone is None:
-                    return jsonify({"error": "Episode not found"}), 404
-                metadata = {"title": tombstone.get("title") or episode_id}
-            else:
-                # Load episode metadata to get video URL
-                try:
-                    with open(json_file, "r") as f:
-                        metadata = json.load(f)
-                except Exception as e:
-                    self.logger.error(f"Error reading episode metadata: {e}")
-                    return jsonify({"error": "Failed to read episode metadata"}), 500
+            job = self.queue.enqueue(
+                channel=channel_name,
+                video_id=episode_id,
+                title=title,
+                url=f"https://www.youtube.com/watch?v={episode_id}",
+                snapshot=queue_job_snapshot(channel_config, config),
+                kind="redownload",
+            )
+            if job is None:
+                return self._redownload_not_queued(channel_name, episode_id)
 
-            video_url = f"https://www.youtube.com/watch?v={episode_id}"
-            video_title = metadata.get("title", "Unknown")
-
-            import tempfile
-
-            try:
-                from .downloader import YouTubeDownloader
-            except ImportError:
-                from downloader import YouTubeDownloader
-
-            video_info = {
-                "id": episode_id,
-                "title": video_title,
-                "url": video_url,
-                "upload_date": metadata.get("upload_date", ""),
-                "duration": metadata.get("duration", 0),
-            }
-            with tempfile.TemporaryDirectory(
-                dir=self.videos_dir, prefix=".redownload-"
-            ) as staging:
-                downloader = YouTubeDownloader(
-                    str(self.config_dir / "channels.yaml"), videos_dir=staging
-                )
-                success = downloader.download_video(
-                    video_info,
-                    channel_name,
-                    sponsorblock_categories=channel_config.get(
-                        "sponsorblock_categories"
-                    ),
-                    format_type=channel_config.get("format", "video"),
-                    quality=channel_config.get("quality", "max"),
-                )
-                staged_channel = Path(staging) / channel_name
-                staged_metadata = staged_channel / f"{episode_id}.json"
-                staged_media = [
-                    staged_channel / f"{episode_id}{ext}" for ext in MEDIA_EXTENSIONS
-                ]
-                staged_media = [
-                    path
-                    for path in staged_media
-                    if path.is_file() and path.stat().st_size > 0
-                ]
-                if not success or not staged_metadata.is_file() or not staged_media:
-                    return jsonify(
-                        {"error": "Failed to redownload episode; original preserved"}
-                    ), 500
-                channel_dir.mkdir(parents=True, exist_ok=True)
-                thumbnails = channel_dir / "thumbnails"
-                thumbnails.mkdir(exist_ok=True)
-                for thumbnail in (staged_channel / "thumbnails").glob(
-                    f"{episode_id}.*"
-                ):
-                    thumbnail.replace(thumbnails / thumbnail.name)
-                for media in staged_media:
-                    media.replace(channel_dir / media.name)
-                staged_metadata.replace(json_file)
-                new_names = {path.name for path in staged_media}
-                for ext in MEDIA_EXTENSIONS:
-                    old_media = channel_dir / f"{episode_id}{ext}"
-                    if old_media.name not in new_names:
-                        old_media.unlink(missing_ok=True)
-
-            # A successful explicit redownload lifts the tombstone so the
-            # episode is a normal, downloadable episode again.
-            if remove_episode_tombstone(self.config_dir, channel_name, episode_id):
-                self.logger.info(f"Cleared tombstone for redownloaded {episode_id}")
-
-            # RSS feed will automatically reflect changes on next request (dynamic generation)
-            self.logger.info(f"Successfully redownloaded episode {episode_id}")
+            self._add_log_message(f"➕ Queued redownload: {title}")
             return jsonify(
-                {
-                    "success": True,
-                    "message": f"Episode '{video_title}' redownloaded successfully",
-                }
-            ), 200
+                {"message": f"Redownload of '{title}' queued", "job": job}
+            ), 202
 
         except StateFileError as e:
             return self._tombstones_unavailable(e)
         except Exception as e:
             self.logger.error(
-                f"Error redownloading episode {channel_name}/{episode_id}: {e}"
+                f"Error queueing redownload of {channel_name}/{episode_id}: {e}"
             )
             return jsonify({"error": "Internal server error"}), 500
+
+    def _redownload_title(self, channel_name: str, episode_id: str) -> str | None:
+        """Return the title of an episode that may be redownloaded.
+
+        Stored episodes use their metadata title. A remembered-deleted
+        (tombstoned) episode has no files left but may still be redownloaded
+        explicitly, so its tombstone title is used instead.
+
+        Returns:
+            The title, or None when the episode is neither stored nor
+            remembered as deleted.
+
+        Raises:
+            StateFileError: When ``tombstones.json`` cannot be read.
+        """
+        json_file = self.videos_dir / channel_name / f"{episode_id}.json"
+        if json_file.exists():
+            metadata = load_json_file(str(json_file))
+            return str(metadata.get("title") or episode_id)
+        tombstone = (
+            load_tombstones(self.config_dir, quarantine=False)
+            .get(channel_name, {})
+            .get(episode_id)
+        )
+        if tombstone is None:
+            return None
+        return str(tombstone.get("title") or episode_id)
+
+    def _redownload_not_queued(self, channel_name: str, episode_id: str):
+        """Explain why ``enqueue`` refused a redownload job.
+
+        Returns 409 with the conflicting job when an active job already
+        covers the episode, otherwise 500 because the queue is unusable.
+        """
+        for job in self.queue.jobs():
+            if (
+                job["state"] in ACTIVE_STATES
+                and job["channel"] == channel_name
+                and job["video_id"] == episode_id
+            ):
+                return jsonify(
+                    {
+                        "error": "This episode is already queued for download",
+                        "job": job,
+                    }
+                ), 409
+        return jsonify({"error": "Could not queue redownload"}), 500
 
     def _serve_index(self) -> str:
         """Generate and serve modern index page."""

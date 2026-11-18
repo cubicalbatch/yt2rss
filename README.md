@@ -152,18 +152,20 @@ logged with the matched rule in the refresh logs.
 
 Manual and scheduled refreshes share one worker slot. A manual refresh returns
 HTTP 409 while another refresh or media operation is running; a scheduled
-refresh that finds the worker busy (another refresh, a download, or a
-purge/delete/redownload in progress) is not dropped but retried after 5
-minutes, repeating until it can run. Purge, delete, and
-redownload requests return HTTP 409 while a media operation is running. A failed
-redownload preserves the existing episode. Cleanup counts completed episodes and
-removes all supported media formats belonging to expired episodes.
+refresh that finds the worker busy (another refresh, a queued download, or a
+purge/delete in progress) is not dropped but retried after 5 minutes, repeating
+until it can run. Purge and delete requests return HTTP 409 while a media
+operation is running. Redownload requests are never rejected for that reason:
+they are queued like any other download (see below) and a failed redownload
+preserves the existing episode. Cleanup counts completed episodes and removes
+all supported media formats belonging to expired episodes.
 
 ### Download Queue
 
 Refreshes no longer download videos inline. Discovery enqueues every new
 video into a durable queue (`appdata/config/download_queue.json`), and a
-single worker thread downloads them one at a time:
+single worker thread downloads them one at a time. Explicit episode
+redownloads run through the same queue:
 
 - Jobs survive restarts: a queue file is written atomically after every
   change, jobs left `running` by a crash are requeued on startup, and a
@@ -180,9 +182,10 @@ single worker thread downloads them one at a time:
 - Jobs can be cancelled while pending or running (a running download aborts
   cooperatively and its partial files are removed). Completed history is
   capped at the newest 200 entries.
-- Duplicate protection: at most one active job per (channel, video).
+- Duplicate protection: at most one active job per (channel, video), whether
+  it is a download or a redownload.
 - The queue worker shares `media.lock` with refreshes and destructive
-  actions, so downloads never race purge/delete/redownload operations.
+  actions, so downloads and redownloads never race purge/delete operations.
 - The channel's *current* format/quality settings apply when a queued job
   runs; deleting a channel cancels its queued jobs.
 - If `channels.yaml` cannot be read or parsed (missing, unreadable, invalid
@@ -190,9 +193,26 @@ single worker thread downloads them one at a time:
   retry every minute without using any of their attempts, showing the
   reason as their error, and resume once the file is fixed. Only jobs whose
   channel is absent from a valid configuration are cancelled.
+- **Redownloads** (`POST /api/channels/<channel>/episodes/<episode_id>/redownload`)
+  return HTTP 202 immediately with `{"message": ..., "job": ...}`, a job of
+  `kind` `redownload` (refresh-discovered jobs have `kind` `download`); the
+  endpoint answers 404 for an unknown channel or episode and 409 (with the
+  conflicting `job`) while an active job already covers the episode. The job
+  gets progress, cancellation and retries like any download and uses the
+  channel's current format/quality/SponsorBlock settings. The new copy is
+  staged in a temporary `.redownload-*` directory and replaces the episode's
+  media, metadata and thumbnail only once it is complete, so a failed,
+  incomplete or cancelled redownload leaves the original untouched. As an
+  explicit user action it skips episode filters and tombstones and ignores
+  quotas (the episode replaces itself), but low free-space protection still
+  blocks it as a terminal failure; it never triggers `max_episodes` cleanup
+  or retention.
 
 The UI shows a collapsible "Download Queue" panel with the active job's
-progress bar, pending count, and failed jobs with Retry/Dismiss actions.
+progress bar, pending count, and failed jobs with Retry/Dismiss actions;
+redownload jobs carry a "Redownload" label. The episode browser's Redownload
+button follows its queued job, showing the progress percentage and the final
+result.
 
 Queue management API (session-authenticated when `YT2RSS_PASSWORD` is set):
 
@@ -273,8 +293,8 @@ Deleting an episode from the episode browser records it in
 title}}}`) so refreshes never download it again:
 
 - Discovery skips tombstoned videos (logged as "deleted by the user"), and
-  queue execution cancels a queued job for a tombstoned video instead of
-  downloading it. The RSS feed and episode counts never include them.
+  queue execution cancels a queued download job for a tombstoned video
+  instead of downloading it. The RSS feed and episode counts never include them.
 - A corrupt `tombstones.json` is quarantined as `tombstones.json.corrupt`
   (later corruptions get a timestamped name, so backups are never
   overwritten) and the app starts with an empty set — deletions are lost,

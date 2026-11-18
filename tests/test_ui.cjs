@@ -143,3 +143,130 @@ test('health panel renders channel state, disk and pending alerts', async () => 
         child => (child.textContent || '').includes('Channel failed three times')
     ));
 });
+
+function stubRedownload(context, jobStates, redownloadResponse) {
+    const harness = { toasts: [], timers: [], requests: [] };
+    context.confirm = () => true;
+    context.showToast = message => harness.toasts.push(message);
+    context.setTimeout = (callback, delay) => harness.timers.push({ callback, delay });
+    context.fetch = async (url, options = {}) => {
+        harness.requests.push({ url, method: options.method || 'GET' });
+        if (url.endsWith('/redownload')) return redownloadResponse;
+        if (url === '/api/queue/job1') {
+            const job = jobStates.shift();
+            return { ok: true, status: 200, json: async () => job };
+        }
+        return { ok: true, status: 200, json: async () => ({ jobs: [], summary: {} }) };
+    };
+    harness.runTimer = async expectedDelay => {
+        const timer = harness.timers.shift();
+        assert.equal(timer.delay, expectedDelay);
+        await timer.callback();
+    };
+    harness.pollCount = () => harness.requests.filter(r => r.url === '/api/queue/job1').length;
+    return harness;
+}
+
+const QUEUED = {
+    ok: true,
+    status: 202,
+    json: async () => ({ message: 'queued', job: { id: 'job1', kind: 'redownload', state: 'pending' } }),
+};
+
+function redownloadButton() {
+    const button = new Element('button');
+    button.textContent = '🔄 Redownload';
+    return button;
+}
+
+test('redownload queues a job and follows it to completion', async () => {
+    const { context } = setup();
+    const harness = stubRedownload(context, [
+        { id: 'job1', state: 'pending', attempts: 0 },
+        { id: 'job1', state: 'running', progress: { percent: 42.4 } },
+        { id: 'job1', state: 'completed', title: 'Episode' },
+    ], QUEUED);
+    const button = redownloadButton();
+
+    await context.redownloadEpisode('channel', 'vid 1', 'Episode', button);
+    assert.equal(button.textContent, '⏳ Queued');
+    assert.equal(button.disabled, true);
+    assert.deepEqual(harness.requests.slice(0, 2), [
+        { url: '/api/channels/channel/episodes/vid%201/redownload', method: 'POST' },
+        { url: '/api/queue', method: 'GET' },
+    ]);
+
+    await harness.runTimer(2000);
+    assert.equal(button.textContent, '⏳ Queued');
+    await harness.runTimer(2000);
+    assert.equal(button.textContent, '⏳ 42%');
+    await harness.runTimer(2000);
+    assert.equal(button.textContent, '✅ Redownloaded!');
+    assert.equal(harness.pollCount(), 3);
+    assert.equal(harness.requests.at(-1).url, '/api/queue');
+
+    await harness.runTimer(2000);
+    assert.equal(button.textContent, '🔄 Redownload');
+    assert.equal(button.disabled, false);
+    assert.equal(harness.timers.length, 0, 'polling stops on a terminal state');
+});
+
+test('failed redownload job shows its error and re-enables the button', async () => {
+    const { context } = setup();
+    const harness = stubRedownload(context, [
+        { id: 'job1', state: 'failed', error: 'Redownload failed; original episode preserved' },
+    ], QUEUED);
+    const button = redownloadButton();
+
+    await context.redownloadEpisode('channel', 'vid1', 'Episode', button);
+    await harness.runTimer(2000);
+    assert.equal(button.textContent, '❌ Failed');
+    assert.equal(button.title, 'Redownload failed; original episode preserved');
+    assert.match(harness.toasts.at(-1), /original episode preserved/);
+
+    await harness.runTimer(5000);
+    assert.equal(button.textContent, '🔄 Redownload');
+    assert.equal(button.disabled, false);
+    assert.equal(harness.timers.length, 0);
+});
+
+test('rejected redownload request reports the server error', async () => {
+    const { context } = setup();
+    const harness = stubRedownload(context, [], {
+        ok: false,
+        status: 409,
+        json: async () => ({ error: 'This episode is already queued for download' }),
+    });
+    const button = redownloadButton();
+
+    await context.redownloadEpisode('channel', 'vid1', 'Episode', button);
+    assert.equal(button.textContent, '❌ Failed');
+    assert.match(harness.toasts.at(-1), /already queued/);
+    await harness.runTimer(3000);
+    assert.equal(button.textContent, '🔄 Redownload');
+    assert.equal(harness.pollCount(), 0);
+});
+
+test('redownload polling stops once the modal or button goes away', async () => {
+    for (const hide of [
+        context => context.closeEpisodesModal(),
+        (context, button) => { button.isConnected = false; },
+    ]) {
+        const { context } = setup();
+        const harness = stubRedownload(context, [{ id: 'job1', state: 'running' }], QUEUED);
+        const button = redownloadButton();
+        await context.redownloadEpisode('channel', 'vid1', 'Episode', button);
+        hide(context, button);
+        await harness.runTimer(2000);
+        assert.equal(harness.pollCount(), 0);
+        assert.equal(harness.timers.length, 0);
+    }
+});
+
+test('queue panel labels redownload jobs', () => {
+    const { context } = setup();
+    const header = job => context.buildQueueItem(job).children[0].children.map(child => child.textContent);
+    const base = { id: 'job1', channel: 'channel', title: 'Episode', state: 'pending', attempts: 0 };
+    assert.deepEqual(header({ ...base, kind: 'redownload' }), ['Episode', '🔄 Redownload', 'pending']);
+    assert.deepEqual(header({ ...base, kind: 'download' }), ['Episode', 'pending']);
+});

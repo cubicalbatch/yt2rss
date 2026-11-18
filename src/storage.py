@@ -307,6 +307,34 @@ def estimate_download_bytes(
     return max(candidates)
 
 
+def free_space_error(
+    settings: dict[str, Number], videos_dir: Path, free_bytes: int | None = None
+) -> str | None:
+    """Decide whether low-space protection blocks writing more media.
+
+    Args:
+        settings: Global storage settings.
+        videos_dir: Storage root.
+        free_bytes: Precomputed free space; queried when None.
+
+    Returns:
+        ``None`` when enough space is free, otherwise an actionable blocking
+        reason suitable for logs and job errors.
+    """
+    if free_bytes is None:
+        try:
+            free_bytes = free_disk_bytes(videos_dir)
+        except OSError as error:
+            return f"Free disk space check failed: {error}"
+    minimum_gb = settings["min_free_space_gb"]
+    if minimum_gb > 0 and free_bytes < minimum_gb * GB:
+        return (
+            f"Insufficient free disk space: {free_bytes / GB:.1f} GB free, "
+            f"{minimum_gb:g} GB required"
+        )
+    return None
+
+
 def admission_error(
     *,
     settings: dict[str, Number],
@@ -337,19 +365,11 @@ def admission_error(
         blocking reason suitable for logs and job errors.
     """
     effective = effective_channel_storage(settings, channel)
+    blocked = free_space_error(effective, videos_dir, free_bytes)
+    if blocked is not None:
+        return blocked
     if usage_totals is None:
         usage_totals = measure_media_usage(videos_dir)
-    if free_bytes is None:
-        try:
-            free_bytes = free_disk_bytes(videos_dir)
-        except OSError as error:
-            return f"Free disk space check failed: {error}"
-    minimum_bytes = effective["min_free_space_gb"] * GB
-    if minimum_bytes > 0 and free_bytes < minimum_bytes:
-        return (
-            f"Insufficient free disk space: {free_bytes / GB:.1f} GB free, "
-            f"{effective['min_free_space_gb']:g} GB required"
-        )
     if estimate_bytes is None:
         estimate_bytes = estimate_download_bytes(
             channel_dir, format_type, metadata_bytes

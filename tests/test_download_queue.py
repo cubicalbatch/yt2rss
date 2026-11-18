@@ -35,6 +35,9 @@ from tests.test_web_server import app_config as app_config
 from tests.test_web_server import client as client
 from tests.test_web_server import test_server as test_server
 
+# Marks a field missing from a persisted job record.
+ABSENT = object()
+
 
 def enqueue_job(
     queue: DownloadQueue,
@@ -273,6 +276,37 @@ class TestQueueStore:
         )
         assert len(queue.jobs()) == 1
         assert queue.get(first["id"]) is not None
+
+    def test_job_kind_defaults_to_download(self, queue):
+        job = enqueue_job(queue)
+        assert job["kind"] == "download"
+        assert job_state(queue, job["id"])["kind"] == "download"
+
+    def test_redownload_kind_is_persisted(self, queue, config_dir):
+        job = queue.enqueue(
+            channel="c", video_id="v", title="t", url="u", kind="redownload"
+        )
+        assert job is not None and job["kind"] == "redownload"
+        assert job_state(DownloadQueue(config_dir), job["id"])["kind"] == "redownload"
+
+    def test_unknown_kind_is_rejected_on_enqueue(self, queue):
+        with pytest.raises(ValueError):
+            queue.enqueue(channel="c", video_id="v", title="t", url="u", kind="bogus")
+        assert queue.jobs() == []
+
+    @pytest.mark.parametrize("stored", [ABSENT, None, "bogus", 7, ["redownload"]])
+    def test_old_or_unknown_kind_normalizes_to_download(
+        self, queue, config_dir, stored
+    ):
+        job = enqueue_job(queue)
+        queue_file = config_dir / "download_queue.json"
+        data = json.loads(queue_file.read_text())
+        if stored is ABSENT:
+            del data["jobs"][0]["kind"]  # Queue files written before kinds.
+        else:
+            data["jobs"][0]["kind"] = stored
+        queue_file.write_text(json.dumps(data))
+        assert job_state(DownloadQueue(config_dir), job["id"])["kind"] == "download"
 
     def test_terminal_jobs_allow_reenqueue(self, queue):
         first = enqueue_job(queue, video_id="done")

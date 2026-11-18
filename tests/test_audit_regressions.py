@@ -13,6 +13,7 @@ import pytest
 from src.downloader import YouTubeDownloader
 from src.rss_generator import RSSGenerator
 from src.utils import atomic_write_text, cleanup_episodes
+from tests.test_redownload import redownload_and_run
 from tests.test_web_server import (
     another_episode_metadata as another_episode_metadata,
 )
@@ -240,7 +241,6 @@ def test_refresh_uses_custom_paths_and_recovers_from_failure(test_server) -> Non
     [
         ("post", "/api/channels/test_channel/purge"),
         ("delete", "/api/channels/test_channel/episodes/test123abc/delete"),
-        ("post", "/api/channels/test_channel/episodes/test123abc/redownload"),
     ],
 )
 def test_destructive_actions_do_not_race_refresh(
@@ -249,6 +249,31 @@ def test_destructive_actions_do_not_race_refresh(
     assert test_server._begin_refresh()
     try:
         assert getattr(client, method)(path).status_code == 409
+        assert (setup_test_episodes / "test123abc.m4a").exists()
+    finally:
+        test_server._finish_refresh()
+
+
+def test_redownload_waits_in_queue_while_refresh_runs(
+    client, test_server, setup_test_episodes
+) -> None:
+    """Redownloads no longer take media.lock inside the request.
+
+    They are accepted (202) and queued; the queue worker, which needs the
+    lock, cannot start the job until the refresh releases it.
+    """
+    test_server.queue_worker.stop()
+    assert test_server._begin_refresh()
+    try:
+        with patch("src.downloader.YouTubeDownloader.download_video") as download:
+            response = client.post(
+                "/api/channels/test_channel/episodes/test123abc/redownload"
+            )
+            assert response.status_code == 202
+            assert test_server.queue_worker._process_next() is False
+        download.assert_not_called()
+        job = test_server.queue.get(response.get_json()["job"]["id"])
+        assert job is not None and job["state"] == "pending"
         assert (setup_test_episodes / "test123abc.m4a").exists()
     finally:
         test_server._finish_refresh()
@@ -317,17 +342,16 @@ def test_atomic_write_failure_preserves_original_and_cleans_temp(tmp_path) -> No
     assert list(tmp_path.iterdir()) == [target]
 
 
-def test_failed_redownload_preserves_episode(client, setup_test_episodes) -> None:
+def test_failed_redownload_preserves_episode(test_server, setup_test_episodes) -> None:
     original = {
         path.name: path.read_bytes()
         for path in setup_test_episodes.iterdir()
         if path.is_file()
     }
     with patch("src.downloader.YouTubeDownloader.download_video", return_value=False):
-        response = client.post(
-            "/api/channels/test_channel/episodes/test123abc/redownload"
-        )
-    assert response.status_code == 500
+        job = redownload_and_run(test_server)
+    assert job["state"] == "pending"  # Retried with the normal backoff.
+    assert "original episode preserved" in job["error"]
     assert {
         path.name: path.read_bytes()
         for path in setup_test_episodes.iterdir()
@@ -337,7 +361,7 @@ def test_failed_redownload_preserves_episode(client, setup_test_episodes) -> Non
 
 
 def test_successful_redownload_publishes_replacement(
-    client, setup_test_episodes
+    test_server, setup_test_episodes
 ) -> None:
     def download(downloader, video, channel_name, **kwargs) -> bool:
         channel = downloader.videos_dir / channel_name
@@ -351,12 +375,7 @@ def test_successful_redownload_publishes_replacement(
         autospec=True,
         side_effect=download,
     ):
-        assert (
-            client.post(
-                "/api/channels/test_channel/episodes/test123abc/redownload"
-            ).status_code
-            == 200
-        )
+        assert redownload_and_run(test_server)["state"] == "completed"
     assert (setup_test_episodes / "test123abc.mp4").read_bytes() == b"replacement"
     assert not (setup_test_episodes / "test123abc.m4a").exists()
 

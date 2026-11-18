@@ -1419,6 +1419,16 @@ textarea.form-input {
     padding: 2px 8px;
 }
 
+.queue-item-kind {
+    flex-shrink: 0;
+    margin-right: auto;
+    font-size: 0.7rem;
+    color: var(--accent-bright);
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    padding: 2px 8px;
+}
+
 .queue-item-running .queue-item-state {
     color: var(--accent-bright);
     border-color: var(--border-strong);

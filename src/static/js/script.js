@@ -832,20 +832,22 @@ async function deleteEpisode(channelName, episodeId, episodeTitle, button) {
     }
 }
 
+const REDOWNLOAD_POLL_INTERVAL_MS = 2000;
+
 async function redownloadEpisode(channelName, episodeId, episodeTitle, button) {
     const originalText = button.textContent;
 
     // Confirm redownload
-    if (!confirm(`Redownload "${episodeTitle}"?\n\nThe current file will be replaced after the download succeeds.`)) {
+    if (!confirm(`Redownload "${episodeTitle}"?\n\nThe download runs in the download queue. The current file is kept until the new copy is complete.`)) {
         return;
     }
 
     try {
         // Show loading state
-        button.textContent = '⏳ Redownloading...';
+        button.textContent = '⏳ Queueing...';
         button.disabled = true;
 
-        // Make request to redownload endpoint
+        // Queue the redownload; the server answers 202 with the queued job
         const response = await fetch(`/api/channels/${encodeURIComponent(channelName)}/episodes/${encodeURIComponent(episodeId)}/redownload`, {
             method: 'POST',
             headers: {
@@ -859,21 +861,82 @@ async function redownloadEpisode(channelName, episodeId, episodeTitle, button) {
             throw new Error(data.error || 'Redownload failed');
         }
 
-        // Show success state briefly
-        button.textContent = '✅ Redownloaded!';
-        setTimeout(() => {
-            button.textContent = originalText;
-            button.disabled = false;
-        }, 2000);
+        button.textContent = '⏳ Queued';
+        showToast(`🔄 Redownload queued: ${episodeTitle}`);
+        refreshQueuePanel();
+        scheduleRedownloadPoll(data.job.id, button, originalText);
 
     } catch (error) {
         console.error('Error redownloading episode:', error);
         button.textContent = '❌ Failed';
-        setTimeout(() => {
-            button.textContent = originalText;
-            button.disabled = false;
-        }, 3000);
+        showToast(`❌ ${error.message || 'Redownload failed'}`);
+        resetRedownloadButton(button, originalText, 3000);
     }
+}
+
+function scheduleRedownloadPoll(jobId, button, originalText) {
+    setTimeout(() => pollRedownloadJob(jobId, button, originalText), REDOWNLOAD_POLL_INTERVAL_MS);
+}
+
+// Follow a queued redownload until it ends or its button leaves the page.
+async function pollRedownloadJob(jobId, button, originalText) {
+    const modal = document.getElementById('episodesModal');
+    if (button.isConnected === false || (modal && modal.style.display === 'none')) {
+        return;
+    }
+
+    let job = null;
+    try {
+        const response = await fetch(`/api/queue/${encodeURIComponent(jobId)}`);
+        if (response.status === 404) {
+            // The job was dismissed elsewhere; there is nothing left to follow.
+            resetRedownloadButton(button, originalText, 0);
+            return;
+        }
+        if (response.ok) job = await response.json();
+    } catch (error) {
+        console.error('Error checking redownload job:', error);
+    }
+
+    if (job && ['completed', 'failed', 'cancelled'].includes(job.state)) {
+        finishRedownload(job, button, originalText);
+        return;
+    }
+    if (job) button.textContent = redownloadProgressLabel(job);
+    scheduleRedownloadPoll(jobId, button, originalText);
+}
+
+function redownloadProgressLabel(job) {
+    if (job.state === 'running') {
+        const percent = job.progress && typeof job.progress.percent === 'number'
+            ? job.progress.percent
+            : null;
+        return percent === null ? '⏳ Downloading...' : `⏳ ${Math.round(percent)}%`;
+    }
+    return job.attempts > 0 ? '⏳ Retrying...' : '⏳ Queued';
+}
+
+function finishRedownload(job, button, originalText) {
+    refreshQueuePanel();
+    if (job.state === 'completed') {
+        button.textContent = '✅ Redownloaded!';
+        showToast(`✅ Redownloaded: ${job.title || job.video_id}`);
+        resetRedownloadButton(button, originalText, 2000);
+        return;
+    }
+    const error = job.error || `Redownload ${job.state}`;
+    button.textContent = `❌ ${job.state === 'cancelled' ? 'Cancelled' : 'Failed'}`;
+    button.title = error;
+    showToast(`❌ Redownload ${job.state}: ${error}`);
+    resetRedownloadButton(button, originalText, 5000);
+}
+
+function resetRedownloadButton(button, originalText, delayMs) {
+    setTimeout(() => {
+        button.textContent = originalText;
+        button.title = '';
+        button.disabled = false;
+    }, delayMs);
 }
 
 async function togglePin(channelName, episodeId, pinned, button) {
@@ -1150,10 +1213,17 @@ function buildQueueItem(job) {
     const title = document.createElement('span');
     title.className = 'queue-item-title';
     title.textContent = job.title || job.video_id;
+    header.append(title);
+    if (job.kind === 'redownload') {
+        const kindTag = document.createElement('span');
+        kindTag.className = 'queue-item-kind';
+        kindTag.textContent = '🔄 Redownload';
+        header.append(kindTag);
+    }
     const stateTag = document.createElement('span');
     stateTag.className = 'queue-item-state';
     stateTag.textContent = job.state;
-    header.append(title, stateTag);
+    header.append(stateTag);
     item.append(header);
 
     const metaParts = [job.channel];

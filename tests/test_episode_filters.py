@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 import pytest
 import yaml
 
+from src.downloader import YouTubeDownloader
 from src.health import load_health
 from src.storage import (
     load_tombstones,
@@ -43,6 +44,7 @@ from tests.test_download_queue import (
     fast_worker as fast_worker,
 )
 from tests.test_download_queue import wait_until as wait_until
+from tests.test_redownload import redownload_and_run
 from tests.test_web_server import another_episode_metadata as another_episode_metadata
 from tests.test_web_server import app_config as app_config
 from tests.test_web_server import client as client
@@ -141,21 +143,13 @@ class MetadataStubDownloader(StubDownloader):
         return dict(type(self).metadata_to_serve.get(url, {}))
 
 
-class FakeStagedDownloader:
-    """Downloader fake for the redownload staging path.
+class FakeStagedDownloader(YouTubeDownloader):
+    """Real downloader whose ``download_video`` never contacts YouTube.
 
     Writes a complete episode (media, metadata, thumbnail) into the
-    videos directory it was given — the redownload handler stages into a
+    videos directory it was given — a redownload job stages into a
     temporary directory and moves successful results into the channel.
     """
-
-    def __init__(
-        self,
-        config_path: str = "channels.yaml",
-        base_dir: str = ".",
-        videos_dir: str | None = None,
-    ):
-        self.videos_dir = Path(videos_dir or ".")
 
     def download_video(
         self,
@@ -976,11 +970,9 @@ class TestTombstoneLifecycle:
         assert "test123abc" in tombstoned_ids(test_server.config_dir, "test_channel")
 
         with patch("src.downloader.YouTubeDownloader", FakeStagedDownloader):
-            response = client.post(
-                "/api/channels/test_channel/episodes/test123abc/redownload"
-            )
+            job = redownload_and_run(test_server)
 
-        assert response.status_code == 200
+        assert job["state"] == "completed"
         assert load_tombstones(test_server.config_dir) == {}
         channel_dir = setup_test_episodes
         assert (channel_dir / "test123abc.m4a").read_bytes() == b"fresh-staged-audio"
@@ -998,11 +990,9 @@ class TestTombstoneLifecycle:
         assert not (channel_dir / "test123abc.json").exists()
 
         with patch("src.downloader.YouTubeDownloader", FakeStagedDownloader):
-            response = client.post(
-                "/api/channels/test_channel/episodes/test123abc/redownload"
-            )
+            job = redownload_and_run(test_server)
 
-        assert response.status_code == 200
+        assert job["state"] == "completed"
         assert load_tombstones(test_server.config_dir) == {}
         assert (channel_dir / "test123abc.json").is_file()
         assert (channel_dir / "test123abc.m4a").is_file()
@@ -1010,6 +1000,7 @@ class TestTombstoneLifecycle:
     def test_redownload_unknown_episode_is_404(self, client, test_server):
         response = client.post("/api/channels/test_channel/episodes/ghost/redownload")
         assert response.status_code == 404
+        assert test_server.queue.jobs() == []
 
     def test_purge_clears_tombstones(self, client, test_server, setup_test_episodes):
         record_tombstone(test_server.config_dir, "test_channel", "vid1", "One")
